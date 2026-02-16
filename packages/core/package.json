@@ -15,6 +15,10 @@
     "./handlers/streams.js": {
       "types": "./handlers/streams.d.ts",
       "default": "./handlers/streams.js"
+    },
+    "./handlers/abort-signal.js": {
+      "types": "./handlers/abort-signal.d.ts",
+      "default": "./handlers/abort-signal.js"
     }
   },
   "files": [
