@@ -685,4 +685,80 @@ void suite('nested proxy mode (nestedProxies: true)', () => {
       assert.strictEqual(result, 30);
     });
   });
+
+  void suite('proxy ID collision regression', () => {
+    // Regression: proxied methods on the expose side consume local IDs.
+    // If both sides use overlapping ID spaces, a callback sent from the
+    // wrap side can collide with an expose-side local ID, causing
+    // #processFromClone to treat the callback as a round-tripped local
+    // object instead of creating a remote proxy.
+    // Fix: expose side uses even IDs, wrap side uses odd IDs.
+
+    void test('callback works after proxied methods consume IDs', async () => {
+      const service = {
+        getSub(): {
+          invoke: (cb: (v: number) => void) => void;
+          a: () => string;
+          b: () => string;
+          c: () => string;
+        } {
+          return {
+            invoke(cb: (v: number) => void) {
+              cb(42);
+            },
+            a: () => 'a',
+            b: () => 'b',
+            c: () => 'c',
+          };
+        },
+      };
+
+      await using ctx = await setupService(service, {nestedProxies: true});
+      const sub = await ctx.remote.getSub();
+
+      const result = await new Promise<number>((resolve) => {
+        sub.invoke((v: number) => resolve(v));
+      });
+      assert.strictEqual(result, 42);
+    });
+
+    void test('stored callback invoked later receives correct data', async () => {
+      let stored: ((v: number) => void) | undefined;
+
+      const service = {
+        getSub(): {
+          subscribe: (cb: (v: number) => void) => void;
+          a: () => string;
+          b: () => string;
+          c: () => string;
+        } {
+          return {
+            subscribe(cb: (v: number) => void) {
+              stored = cb;
+            },
+            a: () => 'a',
+            b: () => 'b',
+            c: () => 'c',
+          };
+        },
+      };
+
+      await using ctx = await setupService(service, {nestedProxies: true});
+      const sub = await ctx.remote.getSub();
+
+      const received = new Promise<number>((resolve) => {
+        sub.subscribe((v: number) => resolve(v));
+      });
+
+      // Wait for subscribe message to be processed on the expose side
+      await new Promise((r) => setTimeout(r, 50));
+
+      if (stored === undefined) {
+        throw new Error('Callback should have been stored');
+      }
+      stored(99);
+
+      assert.strictEqual(await received, 99);
+    });
+  });
 });
