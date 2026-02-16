@@ -83,6 +83,7 @@ export class Connection {
   #handlersByWireType = new Map<string, Handler>();
 
   #nextId = 0;
+  #idStep = 1;
 
   // Local object registry (strong refs) - objects we expose to remote
   #localById = new Map<number, object>();
@@ -150,9 +151,22 @@ export class Connection {
   }
 
   /**
+   * Allocate the next unique ID for this side of the connection.
+   * After side selection (expose/wrap), IDs increment by 2 to ensure
+   * the expose side uses even IDs and the wrap side uses odd IDs.
+   */
+  #allocId(): number {
+    const id = this.#nextId;
+    this.#nextId += this.#idStep;
+    return id;
+  }
+
+  /**
    * Expose an object as the root service and send the ready signal.
    */
   expose(obj: object): void {
+    // Use even IDs (0, 2, 4, ...) on the expose side
+    this.#idStep = 2;
     this.#registerLocal(obj);
     this.#post({
       type: 'return',
@@ -178,9 +192,10 @@ export class Connection {
    * Returns a proxy for the root service.
    */
   waitForReady(): Promise<unknown> {
-    // Skip ID 0 on the wrap side - it's reserved for the root service on the
-    // expose side. This ensures local IDs don't collide with remote IDs.
+    // Use odd IDs (1, 3, 5, ...) on the wrap side.
+    // This ensures local IDs never collide with the expose side's even IDs.
     this.#nextId = 1;
+    this.#idStep = 2;
     return new Promise((resolve, reject) => {
       this.#pendingCalls.set(HANDSHAKE_ID, {
         resolve,
@@ -201,7 +216,7 @@ export class Connection {
     if (id !== undefined) {
       return id;
     }
-    id = this.#nextId++;
+    id = this.#allocId();
     this.#localById.set(id, obj);
     this.#localByObject.set(obj, id);
     return id;
@@ -534,7 +549,7 @@ export class Connection {
    * Register a local promise for sending to remote.
    */
   #registerPromise(promise: Promise<unknown>): number {
-    const id = this.#nextId++;
+    const id = this.#allocId();
     promise.then(
       (value) => {
         const transfers: Array<Transferable> = [];
@@ -649,7 +664,7 @@ export class Connection {
     transfers: Array<Transferable>,
   ): Promise<unknown> {
     const {promise, resolve, reject} = Promise.withResolvers<unknown>();
-    const id = this.#nextId++;
+    const id = this.#allocId();
     this.#pendingCalls.set(id, {resolve, reject});
     this.#post({type: 'call', id, target, action, method, args}, transfers);
     return promise;
