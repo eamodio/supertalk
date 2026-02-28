@@ -1,5 +1,5 @@
 /**
- * Test utilities for @supertalk/signals (in-process, MessageChannel-based).
+ * Test utilities for @eamodio/supertalk-signals (in-process, MessageChannel-based).
  *
  * WARNING: These utilities run both sides in the same thread with a shared
  * signal graph. This is fine for:
@@ -12,8 +12,8 @@
  */
 
 import {MessageChannel, type MessagePort} from 'node:worker_threads';
-import {expose, wrap} from '@supertalk/core';
-import type {Remote, Options} from '@supertalk/core';
+import {expose, wrap} from '@eamodio/supertalk-core';
+import type {Remote, Options} from '@eamodio/supertalk-core';
 import {SignalHandler} from '../../index.js';
 import type {SignalHandlerOptions} from '../../index.js';
 

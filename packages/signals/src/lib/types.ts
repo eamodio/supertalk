@@ -1,10 +1,10 @@
 /**
- * @fileoverview Type definitions for @supertalk/signals.
+ * @fileoverview Type definitions for @eamodio/supertalk-signals.
  *
  * This file defines the types used by the signals handler.
  */
 
-import {WIRE_TYPE} from '@supertalk/core';
+import {WIRE_TYPE} from '@eamodio/supertalk-core';
 import type {Signal} from 'signal-polyfill';
 
 /**

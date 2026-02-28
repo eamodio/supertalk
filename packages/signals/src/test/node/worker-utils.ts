@@ -1,5 +1,5 @@
 /**
- * Test utilities for @supertalk/signals using real workers.
+ * Test utilities for @eamodio/supertalk-signals using real workers.
  *
  * Using real workers ensures the sender and receiver have completely
  * isolated signal graphs, which is critical for accurate testing.
@@ -11,8 +11,8 @@ import {
 } from 'node:worker_threads';
 import {fileURLToPath} from 'node:url';
 import {dirname, join} from 'node:path';
-import {wrap} from '@supertalk/core';
-import type {Endpoint} from '@supertalk/core';
+import {wrap} from '@eamodio/supertalk-core';
+import type {Endpoint} from '@eamodio/supertalk-core';
 import {SignalHandler} from '../../index.js';
 import type {SignalHandlerOptions, RemoteSignal} from '../../index.js';
 

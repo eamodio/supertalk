@@ -24,13 +24,13 @@
  */
 
 import {Signal} from 'signal-polyfill';
-import {WIRE_TYPE} from '@supertalk/core';
+import {WIRE_TYPE} from '@eamodio/supertalk-core';
 import type {
   Handler,
   HandlerConnectionContext,
   ToWireContext,
   FromWireContext,
-} from '@supertalk/core';
+} from '@eamodio/supertalk-core';
 import {RemoteSignal} from './remote-signal.js';
 import type {AnySignal, WireSignal, SignalBatchUpdate} from './types.js';
 import {
