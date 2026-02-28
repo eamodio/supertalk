@@ -1,5 +1,5 @@
 {
-  "name": "supertalk",
+  "name": "@eamodio/supertalk",
   "version": "0.0.6",
   "description": "Type-safe client/server communication for workers, iframes, and RPC",
   "type": "module",
@@ -54,19 +54,23 @@
     "comlink",
     "typescript"
   ],
-  "author": "Justin Fagnani",
+  "author": "Eric Amodio",
+  "contributors": ["Justin Fagnani"],
   "license": "MIT",
-  "homepage": "https://github.com/justinfagnani/supertalk#readme",
+  "homepage": "https://github.com/eamodio/supertalk#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/justinfagnani/supertalk.git",
+    "url": "https://github.com/eamodio/supertalk.git",
     "directory": "packages/supertalk"
   },
   "bugs": {
-    "url": "https://github.com/justinfagnani/supertalk/issues"
+    "url": "https://github.com/eamodio/supertalk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
-    "@supertalk/core": "0.0.5"
+    "@eamodio/supertalk-core": "0.0.5"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

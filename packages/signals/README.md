@@ -1,7 +1,7 @@
 # @supertalk/signals
 
-[![CI](https://github.com/justinfagnani/supertalk/actions/workflows/ci.yml/badge.svg)](https://github.com/justinfagnani/supertalk/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@supertalk/signals.svg)](https://www.npmjs.com/package/@supertalk/signals)
+[![CI](https://github.com/eamodio/supertalk/actions/workflows/ci.yml/badge.svg)](https://github.com/eamodio/supertalk/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@eamodio/supertalk-signals.svg)](https://www.npmjs.com/package/@eamodio/supertalk-signals)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 > [!WARNING]

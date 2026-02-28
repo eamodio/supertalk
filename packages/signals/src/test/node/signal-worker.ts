@@ -7,7 +7,7 @@
  */
 
 import {parentPort, workerData} from 'node:worker_threads';
-import {expose} from '@supertalk/core';
+import {expose} from '@eamodio/supertalk-core';
 import {Signal} from 'signal-polyfill';
 import {SignalHandler} from '../../index.js';
 import type {SignalHandlerOptions} from '../../index.js';
