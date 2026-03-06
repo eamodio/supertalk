@@ -95,8 +95,15 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
   // returns them even if the underlying signal was read elsewhere.
   #signalWrappers = new Map<number, Signal.Computed<unknown>>();
 
+  // Reverse lookup: wrapper → signalId for O(1) flush
+  #wrapperToSignalId = new Map<Signal.Computed<unknown>, number>();
+
   // Receiver side: RemoteSignals we've created, indexed by ID
   #remoteSignals = new Map<number, WeakRef<RemoteSignal<unknown>>>();
+  // Buffer for batch updates that arrive before #receiveSignal creates the
+  // RemoteSignal. This closes the autoWatch:true race where #startWatching
+  // sends a batch update before the wire representation has been deserialized.
+  #pendingUpdates = new Map<number, unknown>();
   #remoteCleanup = new FinalizationRegistry((signalId: number) => {
     this.#remoteSignals.delete(signalId);
     // Send release message through handler messaging
@@ -207,10 +214,16 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
       return existing;
     }
 
-    // Create new RemoteSignal with initial value and watch state callback
+    // Check for a buffered update that arrived before this signal was created
+    // (autoWatch:true race — batch update arrives before wire deserialization).
+    const buffered = this.#pendingUpdates.get(wire.signalId);
+    const value = buffered !== undefined ? buffered : initialValue;
+    this.#pendingUpdates.delete(wire.signalId);
+
+    // Create new RemoteSignal with initial (or buffered) value and watch state callback
     const remote = new RemoteSignal(
       wire.signalId,
-      initialValue,
+      value,
       this.#onRemoteWatchStateChange,
     );
     this.#remoteSignals.set(wire.signalId, new WeakRef(remote));
@@ -260,9 +273,18 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
     const watcher = this.#ensureWatcher();
     const wrapper = new Signal.Computed(() => signal.get());
     this.#signalWrappers.set(signalId, wrapper);
+    this.#wrapperToSignalId.set(wrapper, signalId);
     watcher.watch(wrapper);
-    // Read the wrapper to establish the subscription
-    wrapper.get();
+
+    // Read current value to establish the subscription, then send it.
+    // This closes the race window between the initial toWire (which captured
+    // the value at send time) and this watch start. Any changes that occurred
+    // in between are delivered immediately rather than lost.
+    const currentValue = wrapper.get();
+    this.#ctx?.sendMessage({
+      type: 'signal:batch',
+      updates: [{signalId, value: currentValue}],
+    } satisfies SignalBatchUpdate);
   }
 
   /**
@@ -279,6 +301,7 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
 
     this.#watcher?.unwatch(wrapper);
     this.#signalWrappers.delete(signalId);
+    this.#wrapperToSignalId.delete(wrapper);
   }
 
   /**
@@ -310,18 +333,14 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
     // Collect updates for signals we've sent
     const updates: Array<{signalId: number; value: unknown}> = [];
     for (const wrapper of pending) {
-      // Find which signal this wrapper belongs to
-      for (const [signalId, w] of this.#signalWrappers) {
-        if (w === wrapper) {
-          const signal = this.#sentSignals.get(signalId);
-          if (signal !== undefined) {
-            // Re-evaluate the wrapper to get its new value
-            // and clear its dirty flag
-            const value: unknown = wrapper.get();
-            updates.push({signalId, value});
-          }
-          break;
-        }
+      const signalId = this.#wrapperToSignalId.get(
+        wrapper as Signal.Computed<unknown>,
+      );
+      if (signalId !== undefined && this.#sentSignals.has(signalId)) {
+        // Re-evaluate the wrapper to get its new value
+        // and clear its dirty flag
+        const value: unknown = wrapper.get();
+        updates.push({signalId, value});
       }
     }
 
@@ -347,6 +366,10 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
       const remote = ref?.deref();
       if (remote !== undefined) {
         remote._update(update.value);
+      } else {
+        // Buffer the update — the RemoteSignal may not exist yet if the batch
+        // arrived before #receiveSignal (autoWatch:true race).
+        this.#pendingUpdates.set(update.signalId, update.value);
       }
     }
   }
@@ -360,6 +383,7 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
     if (wrapper !== undefined) {
       this.#watcher?.unwatch(wrapper);
       this.#signalWrappers.delete(signalId);
+      this.#wrapperToSignalId.delete(wrapper);
     }
     this.#sentSignals.delete(signalId);
     // Note: WeakMap entry will be GC'd automatically
