@@ -40,6 +40,7 @@ export type {
   ToWireContext,
   FromWireContext,
   HandlerConnectionContext,
+  Logger,
 } from './lib/types.js';
 
 // Re-export WIRE_TYPE for handlers that need to construct wire values

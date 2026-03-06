@@ -316,6 +316,18 @@ export interface SerializedError {
 }
 
 /**
+ * Console-compatible logger interface.
+ * Pass `console` for development, or any logger with matching methods.
+ * All methods are optional — only implemented levels receive output.
+ */
+export interface Logger {
+  debug?(...data: Array<unknown>): void;
+  info?(...data: Array<unknown>): void;
+  warn?(...data: Array<unknown>): void;
+  error?(...data: Array<unknown>): void;
+}
+
+/**
  * Options for configuring expose() and wrap().
  */
 export interface Options {
@@ -361,6 +373,20 @@ export interface Options {
    * ```
    */
   handlers?: Array<Handler>;
+
+  /**
+   * Optional logger for RPC call tracing, diagnostics, and error reporting.
+   *
+   * Uses a standard console-compatible interface. Pass `console` for
+   * development logging, or any logger with matching methods.
+   *
+   * - `debug`: RPC call tracing (action, method, duration)
+   * - `warn`: Non-cloneable values detected in debug mode
+   * - `error`: Handler onMessage errors
+   *
+   * Zero overhead when not provided.
+   */
+  logger?: Logger;
 }
 
 /**
