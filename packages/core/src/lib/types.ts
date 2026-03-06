@@ -495,6 +495,13 @@ export interface ToWireContext {
    * @param key - Optional key for error path building (e.g., 'name', '0')
    */
   toWire(value: unknown, key?: string): WireValue;
+
+  /**
+   * The RPC call ID associated with the current serialization, if any.
+   * Set when serializing arguments for an outgoing call. Handlers can use
+   * this to track per-call resources and release them via `onCallSettle`.
+   */
+  callId?: number;
 }
 
 /**
@@ -587,6 +594,14 @@ export interface Handler<T = unknown, W extends object = object> {
    * Optional — only needed for subscription-oriented handlers.
    */
   onMessage?(payload: unknown, ctx: FromWireContext): void;
+
+  /**
+   * Called when an outgoing RPC call settles (resolves or rejects).
+   * Allows handlers to release per-call resources automatically without
+   * requiring callers to perform explicit cleanup.
+   * Optional — only needed for handlers that track per-call state.
+   */
+  onCallSettle?(callId: number): void;
 
   /**
    * Called when the connection closes.
