@@ -18,8 +18,21 @@
 import {suite, test} from 'node:test';
 import * as assert from 'node:assert';
 import {setupService} from './test-utils.js';
-import {NonCloneableError, proxy} from '../../index.js';
-import type {Remoted, AsyncProxy} from '../../index.js';
+import {MessageChannel} from 'node:worker_threads';
+import {
+  NonCloneableError,
+  proxy,
+  expose,
+  wrap,
+  WIRE_TYPE,
+} from '../../index.js';
+import type {
+  Remoted,
+  AsyncProxy,
+  Handler,
+  ToWireContext,
+  FromWireContext,
+} from '../../index.js';
 
 // A class instance for testing (not a plain object)
 class Counter {
@@ -355,6 +368,76 @@ void suite('manual mode (nestedProxies: false)', () => {
         transfer(new ArrayBuffer(1024)) as unknown as ArrayBuffer,
       );
       assert.strictEqual(result, 1024);
+    });
+  });
+
+  void suite('service tree property access (get action)', () => {
+    void test('explicit proxy() on property is proxied on access', async () => {
+      class SubService {
+        greet(name: string): string {
+          return `Hello, ${name}!`;
+        }
+      }
+
+      await using ctx = await setupService({
+        sub: proxy(new SubService()),
+      });
+
+      const sub = await ctx.remote.sub;
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      const result = await (sub as unknown as Remoted<SubService>).greet(
+        'world',
+      );
+      assert.strictEqual(result, 'Hello, world!');
+    });
+
+    void test('handler-recognized class instance is processed by handler', async () => {
+      const BOXED_WIRE_TYPE = 'test:boxed';
+      class BoxedValue {
+        constructor(public readonly value: number) {}
+      }
+
+      let handlerSawTheValue = false;
+      const boxedHandler: Handler<
+        BoxedValue,
+        {[WIRE_TYPE]: typeof BOXED_WIRE_TYPE; n: number}
+      > = {
+        wireType: BOXED_WIRE_TYPE,
+        canHandle(v: unknown): v is BoxedValue {
+          return v instanceof BoxedValue;
+        },
+        toWire(v: BoxedValue, _ctx: ToWireContext) {
+          handlerSawTheValue = true;
+          return {[WIRE_TYPE]: BOXED_WIRE_TYPE, n: v.value};
+        },
+        fromWire(
+          w: {[WIRE_TYPE]: typeof BOXED_WIRE_TYPE; n: number},
+          _ctx: FromWireContext,
+        ) {
+          return new BoxedValue(w.n);
+        },
+      };
+
+      const {port1, port2} = new MessageChannel();
+      expose({state: new BoxedValue(42)}, port1, {handlers: [boxedHandler]});
+      const remote = await wrap<{state: BoxedValue}>(port2, {
+        handlers: [boxedHandler],
+      });
+
+      const result = await remote.state;
+
+      assert.ok(
+        handlerSawTheValue,
+        'handler must process the value, not auto-proxy',
+      );
+      assert.ok(
+        result instanceof BoxedValue,
+        'handler should reconstruct the value on remote side',
+      );
+      assert.strictEqual(result.value, 42);
+
+      port1.close();
+      port2.close();
     });
   });
 });
