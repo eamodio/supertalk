@@ -84,6 +84,7 @@ export class Connection {
 
   #nextId = 0;
   #idStep = 1;
+  #closed = false;
 
   // Local object registry (strong refs) - objects we expose to remote
   #localById = new Map<number, object>();
@@ -132,6 +133,7 @@ export class Connection {
   }
 
   #post(message: unknown, transfer?: Array<Transferable>): void {
+    if (this.#closed) return;
     this.#endpoint.postMessage(message, transfer);
   }
 
@@ -176,9 +178,26 @@ export class Connection {
   }
 
   /**
+   * Reject all pending calls/promises so callers don't hang indefinitely.
+   */
+  #dropPendingWork(reason: string): void {
+    const err = new Error(reason);
+    for (const {reject} of this.#pendingCalls.values()) {
+      reject(err);
+    }
+    this.#pendingCalls.clear();
+    for (const {reject} of this.#pendingRemotePromises.values()) {
+      reject(err);
+    }
+    this.#pendingRemotePromises.clear();
+  }
+
+  /**
    * Close the connection and stop listening for messages.
    */
   close(): void {
+    this.#closed = true;
+    this.#dropPendingWork('Connection closed');
     this.#endpoint.removeEventListener('message', this.#onMessage);
 
     // Call disconnect() on handlers that support it
@@ -315,7 +334,12 @@ export class Connection {
       if (path && this.#debug && !this.#nestedProxies) {
         throw new NonCloneableError('transfer', path);
       }
-      transfers.push(value.value);
+      // Dedup: the same underlying Transferable wrapped in two separate
+      // transfer() markers would cause a DataCloneError from postMessage.
+      if (!transfers.includes(value.value)) {
+        transfers.push(value.value);
+      }
+      seen.set(value, value.value);
       return value.value;
     }
 
@@ -332,9 +356,9 @@ export class Connection {
       return wire;
     }
 
-    // Functions are always proxied (or throw in debug-only mode)
+    // Functions are always proxied (or throw in debug-only mode for nested fns)
     if (typeof value === 'function') {
-      if (this.#debug && !this.#nestedProxies) {
+      if (path && this.#debug && !this.#nestedProxies) {
         throw new NonCloneableError('function', path);
       }
       const wire = this.#makeProxyWire(value as object);
@@ -349,9 +373,9 @@ export class Connection {
       return wire;
     }
 
-    // Promises are proxied (or throw in debug-only mode)
+    // Promises are proxied (or throw in debug-only mode for nested promises)
     if (isPromise(value)) {
-      if (this.#debug && !this.#nestedProxies) {
+      if (path && this.#debug && !this.#nestedProxies) {
         throw new NonCloneableError('promise', path);
       }
       const wire = {[WIRE_TYPE]: 'promise', id: this.#registerPromise(value)};
@@ -552,23 +576,40 @@ export class Connection {
     const id = this.#allocId();
     promise.then(
       (value) => {
-        const transfers: Array<Transferable> = [];
-        const wire = this.#toWire(value, '', transfers);
-        this.#post(
-          {
-            type: 'resolve',
+        try {
+          const transfers: Array<Transferable> = [];
+          const wire = this.#toWire(value, '', transfers);
+          this.#post(
+            {
+              type: 'resolve',
+              id,
+              value: wire,
+            },
+            transfers,
+          );
+        } catch {
+          // Serialization or postMessage failed for the resolved value.
+          // Send a reject so the remote side doesn't hang.
+          this.#post({
+            type: 'reject',
             id,
-            value: wire,
-          },
-          transfers,
-        );
+            error: serializeError(
+              new Error('Failed to serialize resolved promise value'),
+            ),
+          });
+        }
       },
       (error: unknown) => {
-        this.#post({
-          type: 'reject',
-          id,
-          error: serializeError(error),
-        });
+        try {
+          this.#post({
+            type: 'reject',
+            id,
+            error: serializeError(error),
+          });
+        } catch {
+          // Nothing more we can do — the reject message itself failed to send.
+          // The remote side's pending promise will be cleaned up on close/reset.
+        }
       },
     );
     return id;
@@ -602,12 +643,17 @@ export class Connection {
             set: (_target, prop, value) => {
               if (typeof prop !== 'string') return false;
               const transfers: Array<Transferable> = [];
+              // Async transport errors cannot be surfaced synchronously
+              // from a Proxy set trap. Catch to prevent unhandled rejections.
               void this.#sendCall(
                 id,
                 'set',
                 prop,
                 [this.#toWire(value, '', transfers)],
                 transfers,
+              ).catch(
+                // eslint-disable-next-line @typescript-eslint/no-empty-function
+                () => {},
               );
               return true;
             },
@@ -666,7 +712,15 @@ export class Connection {
     const {promise, resolve, reject} = Promise.withResolvers<unknown>();
     const id = this.#allocId();
     this.#pendingCalls.set(id, {resolve, reject});
-    this.#post({type: 'call', id, target, action, method, args}, transfers);
+    try {
+      this.#post({type: 'call', id, target, action, method, args}, transfers);
+    } catch (error) {
+      // postMessage can throw synchronously (e.g. structured-clone failure).
+      // Reject the promise instead of propagating synchronously so callers
+      // always get a Promise back (maintaining the async contract).
+      this.#pendingCalls.delete(id);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
     return promise;
   }
 
