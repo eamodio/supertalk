@@ -1,7 +1,9 @@
 import {suite, test} from 'node:test';
 import * as assert from 'node:assert';
+import {MessageChannel} from 'node:worker_threads';
 import {Signal} from 'signal-polyfill';
-import {RemoteSignal} from '../../index.js';
+import {Connection} from '@eamodio/supertalk-core';
+import {RemoteSignal, SignalHandler} from '../../index.js';
 import {
   setupSignalService,
   waitMicrotasks,
@@ -510,6 +512,56 @@ void suite('@supertalk/signals', () => {
     });
   });
 
+  void suite('autoWatch:true race condition', () => {
+    void test('batch update arriving before RemoteSignal creation is buffered', async () => {
+      const count = new Signal.State(0);
+
+      const {port1, port2} = new MessageChannel();
+      const senderHandler = new SignalHandler({autoWatch: true});
+      const receiverHandler = new SignalHandler({autoWatch: true});
+
+      const host = new Connection(port1, {handlers: [senderHandler]});
+
+      // Expose the service — this triggers toWire → #sendSignal → #startWatching
+      // which sends a signal:batch message BEFORE the service tree message.
+      host.expose({
+        get count() {
+          return count;
+        },
+      });
+
+      // Change the signal value synchronously after expose but before the
+      // receiver has processed anything. This triggers the watcher, which
+      // schedules a microtask flush. The flush sends another signal:batch
+      // with the updated value.
+      count.set(42);
+
+      // Now set up the receiver — it will process queued messages including
+      // the batch updates that arrived before the service tree.
+      const wrap = new Connection(port2, {handlers: [receiverHandler]});
+      const remote = (await wrap.waitForReady()) as {
+        count: Signal.State<number>;
+      };
+
+      // Wait for all messages to propagate
+      await waitForMessages();
+
+      const remoteCount =
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- proxy property is thenable at runtime
+        (await remote.count) as unknown as RemoteSignal<number>;
+
+      // The RemoteSignal should have the latest value (42), not the initial (0).
+      // Without the buffering fix, it would have 0 because the batch update
+      // with value 42 was dropped before the RemoteSignal existed.
+      assert.strictEqual(remoteCount.get(), 42);
+
+      wrap.close();
+      host.close();
+      port1.close();
+      port2.close();
+    });
+  });
+
   void suite('Lazy watching (default)', () => {
     void test('sender does not watch signal immediately when sent', async () => {
       const count = new Signal.State(0);
@@ -723,6 +775,38 @@ void suite('@supertalk/signals', () => {
       await ctx.remote.increment();
       await waitForMessages();
       assert.strictEqual(remoteCount.get(), 2); // Now updated
+
+      watcher.unwatch(computed);
+    });
+
+    void test('watch delivers current value when it differs from initial', async () => {
+      const count = new Signal.State(0);
+
+      await using ctx = await setupSignalService({
+        get count() {
+          return count;
+        },
+      });
+
+      const remoteCount = (await ctx.remote
+        .count) as unknown as RemoteSignal<number>;
+      assert.strictEqual(remoteCount.get(), 0);
+
+      // Change value BEFORE receiver starts watching — this is the race window
+      count.set(42);
+
+      // Start watching reactively (triggers signal:watch → #startWatching)
+      // eslint-disable-next-line @typescript-eslint/no-empty-function -- Watcher callback intentionally empty
+      const watcher = new Signal.subtle.Watcher(() => {});
+      const computed = new Signal.Computed(() => remoteCount.get());
+      watcher.watch(computed);
+      computed.get();
+
+      // Wait for: watch message → #startWatching → batch update → receiver
+      await waitForMessages();
+
+      // The current value (42) should have been delivered, not the stale initial (0)
+      assert.strictEqual(remoteCount.get(), 42);
 
       watcher.unwatch(computed);
     });
