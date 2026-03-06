@@ -84,6 +84,10 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
   // Connection context provided by core
   #ctx: HandlerConnectionContext | undefined;
 
+  // Session counter: incremented on disconnect so stale FinalizationRegistry
+  // callbacks from a previous session don't corrupt new IDs after reconnect.
+  #session = 0;
+
   // Sender side: signals we've sent, indexed by ID
   #nextSignalId = 1;
   #sentSignals = new Map<number, AnySignal>();
@@ -104,11 +108,14 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
   // RemoteSignal. This closes the autoWatch:true race where #startWatching
   // sends a batch update before the wire representation has been deserialized.
   #pendingUpdates = new Map<number, unknown>();
-  #remoteCleanup = new FinalizationRegistry((signalId: number) => {
-    this.#remoteSignals.delete(signalId);
-    // Send release message through handler messaging
-    this.#ctx?.sendMessage({type: 'signal:release', signalId});
-  });
+  #remoteCleanup = new FinalizationRegistry(
+    ({signalId, session}: {signalId: number; session: number}) => {
+      if (session !== this.#session) return; // stale finalizer, ignore
+      this.#remoteSignals.delete(signalId);
+      // Send release message through handler messaging
+      this.#ctx?.sendMessage({type: 'signal:release', signalId});
+    },
+  );
 
   constructor(options: SignalHandlerOptions = {}) {
     this.#autoWatch = options.autoWatch ?? false;
@@ -141,12 +148,23 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
    */
   disconnect(): void {
     this.#ctx = undefined;
+    this.#flushScheduled = false;
     if (this.#watcher !== undefined) {
       this.#watcher.unwatch(...this.#signalWrappers.values());
+      this.#watcher = undefined;
     }
     this.#sentSignals.clear();
     this.#signalWrappers.clear();
+    this.#wrapperToSignalId.clear();
     this.#remoteSignals.clear();
+    this.#pendingUpdates.clear();
+    // Increment session so stale FinalizationRegistry callbacks from the
+    // old session are ignored after reconnect (IDs restart from 1).
+    this.#session++;
+    // Reset ID counter and WeakMap so reuse after reconnect doesn't
+    // find stale IDs that skip registration in #sentSignals.
+    this.#signalToId = new WeakMap();
+    this.#nextSignalId = 1;
   }
 
   canHandle(value: unknown): value is AnySignal {
@@ -227,7 +245,10 @@ export class SignalHandler implements Handler<AnySignal, WireSignal> {
       this.#onRemoteWatchStateChange,
     );
     this.#remoteSignals.set(wire.signalId, new WeakRef(remote));
-    this.#remoteCleanup.register(remote, wire.signalId);
+    this.#remoteCleanup.register(remote, {
+      signalId: wire.signalId,
+      session: this.#session,
+    });
     return remote;
   }
 
