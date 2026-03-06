@@ -26,6 +26,7 @@ export {NonCloneableError} from './lib/protocol.js';
 
 // Types
 export type {
+  BatchMessage,
   Endpoint,
   Remote,
   Remoted,
