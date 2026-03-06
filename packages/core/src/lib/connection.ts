@@ -462,12 +462,14 @@ export class Connection {
    * Process a value for wire serialization.
    * Handles markers, recursion, and debug mode errors.
    * @param seen - Map tracking visited objects to their processed results (for cycle detection)
+   * @param callId - If set, the outgoing call ID; passed to handlers via ToWireContext
    */
   #processForClone(
     value: unknown,
     path: string,
     transfers: Array<Transferable>,
     seen: Map<object, unknown>,
+    callId?: number,
   ): unknown {
     // Null and primitives are sent directly
     if (
@@ -547,8 +549,9 @@ export class Connection {
           const ctx: ToWireContext = {
             toWire: (v: unknown, key?: string): WireValue => {
               const p = key ? (path ? `${path}.${key}` : key) : path;
-              return this.#processForClone(v, p, transfers, seen);
+              return this.#processForClone(v, p, transfers, seen, callId);
             },
+            ...(callId !== undefined && {callId}),
           };
           const wire = handler.toWire(value, ctx);
           seen.set(value, wire);
@@ -574,6 +577,7 @@ export class Connection {
             `${path}[${String(i)}]`,
             transfers,
             seen,
+            callId,
           ),
         );
       }
@@ -595,6 +599,7 @@ export class Connection {
           path ? `${path}.${key}` : key,
           transfers,
           seen,
+          callId,
         );
       }
       return processed;
@@ -809,6 +814,7 @@ export class Connection {
               // Async transport errors cannot be surfaced synchronously
               // from a Proxy set trap. Catch to prevent unhandled rejections.
               void this.#sendCall(
+                this.#allocId(),
                 id,
                 'set',
                 prop,
@@ -850,7 +856,7 @@ export class Connection {
         | null,
     ): Promise<TResult1 | TResult2> => {
       this.#assertSession(session);
-      return this.#sendCall(target, 'get', prop, [], []).then(
+      return this.#sendCall(this.#allocId(), target, 'get', prop, [], []).then(
         onfulfilled,
         onrejected,
       );
@@ -870,8 +876,11 @@ export class Connection {
 
   /**
    * Send a call message and return a promise for the response.
+   * The call ID must be pre-allocated by the caller so it can be passed to
+   * serialization context (e.g. for handler per-call tracking).
    */
   #sendCall(
+    callId: number,
     target: number,
     action: 'call' | 'get' | 'set',
     method: string | undefined,
@@ -879,15 +888,17 @@ export class Connection {
     transfers: Array<Transferable>,
   ): Promise<unknown> {
     const {promise, resolve, reject} = Promise.withResolvers<unknown>();
-    const id = this.#allocId();
-    this.#pendingCalls.set(id, {resolve, reject});
+    this.#pendingCalls.set(callId, {resolve, reject});
     try {
-      this.#post({type: 'call', id, target, action, method, args}, transfers);
+      this.#post(
+        {type: 'call', id: callId, target, action, method, args},
+        transfers,
+      );
     } catch (error) {
       // postMessage can throw synchronously (e.g. structured-clone failure).
       // Reject the promise instead of propagating synchronously so callers
       // always get a Promise back (maintaining the async contract).
-      this.#pendingCalls.delete(id);
+      this.#pendingCalls.delete(callId);
       reject(error instanceof Error ? error : new Error(String(error)));
     }
     return promise;
@@ -899,13 +910,19 @@ export class Connection {
     args: Array<unknown>,
   ): Promise<unknown> {
     const transfers: Array<Transferable> = [];
-    // Share seen map across all args to preserve identity for shared references
+    // Share seen map across all args to preserve identity for shared references.
+    // Allocate the call ID before serialization so it can be threaded through
+    // ToWireContext, allowing handlers to track per-call resources.
     const seen = new Map<object, unknown>();
+    const callId = this.#allocId();
     return this.#sendCall(
+      callId,
       target,
       'call',
       method,
-      args.map((arg) => this.#processForClone(arg, '', transfers, seen)),
+      args.map((arg) =>
+        this.#processForClone(arg, '', transfers, seen, callId),
+      ),
       transfers,
     );
   }
@@ -957,9 +974,11 @@ export class Connection {
         break;
       case 'return':
         this.#settlePending(this.#pendingCalls, message.id, message.value);
+        this.#notifyCallSettle(message.id);
         break;
       case 'throw':
         this.#rejectPending(this.#pendingCalls, message.id, message.error);
+        this.#notifyCallSettle(message.id);
         break;
       case 'call':
         void this.#handleCall(message);
@@ -1000,6 +1019,12 @@ export class Connection {
     if (pending) {
       map.delete(id);
       pending.reject(deserializeError(error));
+    }
+  }
+
+  #notifyCallSettle(callId: number): void {
+    for (const handler of this.#handlers) {
+      handler.onCallSettle?.(callId);
     }
   }
 
