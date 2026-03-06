@@ -19,6 +19,7 @@ import type {
   WireProxyProperty,
   WireThrown,
   Options,
+  Logger,
   ProxyPropertyMetadata,
   Handler,
   ToWireContext,
@@ -79,6 +80,7 @@ export class Connection {
   #endpoint: Endpoint;
   #nestedProxies: boolean;
   #debug: boolean;
+  #logger: Logger | undefined;
   #handlers: Array<Handler>;
   #handlersByWireType = new Map<string, Handler>();
 
@@ -105,6 +107,7 @@ export class Connection {
     this.#endpoint = endpoint;
     this.#nestedProxies = options.nestedProxies ?? false;
     this.#debug = options.debug ?? false;
+    this.#logger = options.logger;
     this.#handlers = options.handlers ?? [];
 
     // Build handler lookup map and call connect() on handlers that support it
@@ -839,7 +842,7 @@ export class Connection {
     } catch (error) {
       // Log errors from onMessage but don't propagate them
       // (there's no good place to send them - these are spontaneous messages)
-      console.error(
+      this.#logger?.error?.(
         `Error in handler.onMessage for wireType "${wireType}":`,
         error,
       );
@@ -867,6 +870,9 @@ export class Connection {
         },
       });
     }
+
+    const logger = this.#logger;
+    const start = logger?.debug ? performance.now() : 0;
 
     try {
       let result: unknown;
@@ -906,7 +912,15 @@ export class Connection {
       const transfers: Array<Transferable> = [];
       const wire = this.#toWire(result, '', transfers);
       this.#post({type: 'return', id, value: wire}, transfers);
+      logger?.debug?.(
+        `${action} ${method ?? '(direct)'} completed`,
+        {duration: performance.now() - start},
+      );
     } catch (error) {
+      logger?.debug?.(
+        `${action} ${method ?? '(direct)'} failed`,
+        {duration: performance.now() - start, error},
+      );
       this.#post({type: 'throw', id, error: serializeError(error)});
     }
   }
