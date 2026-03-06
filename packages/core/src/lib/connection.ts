@@ -96,7 +96,8 @@ export class Connection {
   // Remote proxy cache (weak refs) - proxies we received from remote
   #remoteProxyById = new Map<number, WeakRef<object>>();
   #remoteProxyByObject = new WeakMap<object, number>();
-  #remoteCleanup: FinalizationRegistry<number>;
+  #remoteCleanup: FinalizationRegistry<{id: number; session: number}>;
+  #sessionId = 0;
 
   // Pending RPC calls awaiting response
   #pendingCalls = new Map<number, PendingCall>();
@@ -134,14 +135,20 @@ export class Connection {
       }
     }
 
-    // Set up finalization registry to notify remote when proxies are GC'd
-    this.#remoteCleanup = new FinalizationRegistry((id: number) => {
-      this.#remoteProxyById.delete(id);
-      this.#post({type: 'release', id});
-    });
+    // Set up finalization registry to notify remote when proxies are GC'd.
+    // The held value includes a session ID so stale finalizers from before a
+    // reset() are ignored (IDs restart from 0 after reset, so a stale release
+    // could otherwise match a newly allocated ID).
+    this.#remoteCleanup = new FinalizationRegistry(
+      ({id, session}: {id: number; session: number}) => {
+        if (session !== this.#sessionId) return;
+        this.#remoteProxyById.delete(id);
+        this.#post({type: 'release', id});
+      },
+    );
 
-    // Bind and attach message handler
-    // this.#handleMessage = this.#onMessage.bind(this);
+    // #onMessage must be an arrow field (not a method) so the same function
+    // reference is used for both addEventListener and removeEventListener.
     endpoint.addEventListener('message', this.#onMessage);
   }
 
@@ -276,6 +283,83 @@ export class Connection {
     // Call disconnect() on handlers that support it
     for (const handler of this.#handlers) {
       handler.disconnect?.();
+    }
+  }
+
+  /**
+   * Reset the connection for reuse with a new peer.
+   *
+   * Rejects pending operations, clears all registries, cycles handlers
+   * (disconnect + reconnect), and resets ID allocation. After reset(),
+   * call expose() or waitForReady() to start a new session.
+   *
+   * Optionally accepts a new endpoint to replace the current one.
+   * If the connection was previously closed, the message listener is
+   * re-added to the (new or existing) endpoint.
+   */
+  reset(endpoint?: Endpoint): void {
+    this.#dropPendingWork('Connection reset');
+
+    // Clear local object registries
+    this.#localById.clear();
+    // WeakMap has no .clear() — reassign to drop all entries
+    this.#localByObject = new WeakMap();
+
+    // Clear remote proxy cache
+    this.#remoteProxyById.clear();
+    // WeakMap has no .clear() — reassign to drop all entries
+    this.#remoteProxyByObject = new WeakMap();
+    // Increment session ID to invalidate any outstanding FinalizationRegistry
+    // callbacks from the previous session. IDs restart from 0, so without this
+    // a stale finalizer could release a newly allocated object with the same ID.
+    this.#sessionId++;
+
+    // Reset ID allocation
+    this.#nextId = 0;
+    this.#idStep = 1;
+
+    // Disconnect handlers before touching the endpoint or reopening the
+    // connection, so they can't send messages during the transition.
+    for (const handler of this.#handlers) {
+      handler.disconnect?.();
+    }
+
+    // Swap endpoint / re-attach listener before opening the connection.
+    // The connection is still #closed at this point, so incoming messages
+    // are not processed until we set #closed = false below.
+    if (endpoint !== undefined && endpoint !== this.#endpoint) {
+      // Swap endpoint: remove from old (if not already closed), add to new
+      if (!this.#closed) {
+        this.#endpoint.removeEventListener('message', this.#onMessage);
+      }
+      this.#endpoint = endpoint;
+      endpoint.addEventListener('message', this.#onMessage);
+    } else if (this.#closed) {
+      // Same endpoint but was closed — re-add listener
+      this.#endpoint.addEventListener('message', this.#onMessage);
+    }
+    // If not closed and same endpoint: listener is already attached, leave it
+
+    // Open the connection before reconnecting handlers, so any messages sent
+    // during handler.connect() are not silently dropped by #post().
+    this.#closed = false;
+
+    // Reconnect handlers now that the connection is fully open and pointing at
+    // the correct endpoint.
+    for (const handler of this.#handlers) {
+      if (typeof handler.connect === 'function') {
+        handler.connect({
+          sendMessage: (payload: unknown): void => {
+            this.#sendHandlerMessage(handler.wireType, payload);
+          },
+        });
+      }
+    }
+  }
+
+  #assertSession(session: number): void {
+    if (session !== this.#sessionId) {
+      throw new Error('Stale proxy from previous session');
     }
   }
 
@@ -699,22 +783,28 @@ export class Connection {
   #createRemoteProxy(id: number, opaque?: boolean): object {
     let proxy = this.#getRemoteProxy(id);
     if (proxy === undefined) {
+      // Capture the session at proxy creation time so we can detect stale
+      // proxies that survive a reset().
+      const session = this.#sessionId;
       proxy = opaque
         ? // Opaque: simple non-cloneable object (handle)
           {__o: NON_CLONEABLE}
         : // Full proxy with property/method access
           new Proxy(NON_CLONEABLE as object, {
-            apply: (_target, _thisArg, args: Array<unknown>) =>
-              this.#makeCall(id, undefined, args),
+            apply: (_target, _thisArg, args: Array<unknown>) => {
+              this.#assertSession(session);
+              return this.#makeCall(id, undefined, args);
+            },
 
             get: (_target, prop) =>
               // Not thenable at top level (prevents auto-await issues)
               typeof prop === 'string' && prop !== 'then'
-                ? this.#createProxyProperty(id, prop)
+                ? this.#createProxyProperty(id, prop, session)
                 : undefined,
 
             set: (_target, prop, value) => {
               if (typeof prop !== 'string') return false;
+              this.#assertSession(session);
               const transfers: Array<Transferable> = [];
               // Async transport errors cannot be surfaced synchronously
               // from a Proxy set trap. Catch to prevent unhandled rejections.
@@ -733,7 +823,7 @@ export class Connection {
           });
       this.#remoteProxyById.set(id, new WeakRef(proxy));
       this.#remoteProxyByObject.set(proxy, id);
-      this.#remoteCleanup.register(proxy, id);
+      this.#remoteCleanup.register(proxy, {id, session: this.#sessionId});
     }
     return proxy;
   }
@@ -741,8 +831,13 @@ export class Connection {
   /**
    * Create a proxy property for lazy property access.
    */
-  #createProxyProperty(target: number, prop: string): ProxyProperty {
+  #createProxyProperty(
+    target: number,
+    prop: string,
+    session: number,
+  ): ProxyProperty {
     const callable = (...args: Array<unknown>): Promise<unknown> => {
+      this.#assertSession(session);
       return this.#makeCall(target, prop, args);
     };
 
@@ -754,6 +849,7 @@ export class Connection {
         | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
         | null,
     ): Promise<TResult1 | TResult2> => {
+      this.#assertSession(session);
       return this.#sendCall(target, 'get', prop, [], []).then(
         onfulfilled,
         onrejected,
