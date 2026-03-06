@@ -14,6 +14,7 @@
 import type {
   Endpoint,
   Message,
+  BatchMessage,
   CallMessage,
   WireValue,
   WireProxyProperty,
@@ -103,12 +104,21 @@ export class Connection {
   // Promise tracking
   #pendingRemotePromises = new Map<number, PendingCall>();
 
+  // Batching state
+  #batchingEnabled: boolean;
+  #queue: Array<{
+    message: unknown;
+    transfers: Array<Transferable> | undefined;
+  }> = [];
+  #flushScheduled = false;
+
   constructor(endpoint: Endpoint, options: Options = {}) {
     this.#endpoint = endpoint;
     this.#nestedProxies = options.nestedProxies ?? false;
     this.#debug = options.debug ?? false;
     this.#logger = options.logger;
     this.#handlers = options.handlers ?? [];
+    this.#batchingEnabled = options.batching ?? false;
 
     // Build handler lookup map and call connect() on handlers that support it
     for (const handler of this.#handlers) {
@@ -137,7 +147,65 @@ export class Connection {
 
   #post(message: unknown, transfer?: Array<Transferable>): void {
     if (this.#closed) return;
-    this.#endpoint.postMessage(message, transfer);
+    if (!this.#batchingEnabled) {
+      this.#endpoint.postMessage(message, transfer);
+      return;
+    }
+    this.#queue.push({message, transfers: transfer});
+    if (!this.#flushScheduled) {
+      this.#flushScheduled = true;
+      queueMicrotask(() => this.#flush());
+    }
+  }
+
+  #flush(): void {
+    this.#flushScheduled = false;
+    const queue = this.#queue;
+    this.#queue = [];
+    if (queue.length === 0) return;
+
+    // If postMessage throws (e.g. structured-clone failure), reject any pending
+    // calls whose messages are in this batch so callers don't hang indefinitely.
+    const rejectFlushed = (error: unknown): void => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      for (const {message} of queue) {
+        const msg = message as {type?: string; id?: number};
+        if (msg.type === 'call' && msg.id !== undefined) {
+          const pending = this.#pendingCalls.get(msg.id);
+          if (pending) {
+            this.#pendingCalls.delete(msg.id);
+            pending.reject(err);
+          }
+        }
+      }
+    };
+
+    if (queue.length === 1) {
+      // Single message: send directly, no batch wrapper
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      const {message, transfers} = queue[0]!;
+      try {
+        this.#endpoint.postMessage(message, transfers);
+      } catch (error) {
+        rejectFlushed(error);
+      }
+    } else {
+      // Multiple messages: wrap in batch, merge transfer lists
+      const allTransfers: Array<Transferable> = [];
+      const messages: Array<unknown> = [];
+      for (const {message, transfers} of queue) {
+        messages.push(message);
+        if (transfers) allTransfers.push(...transfers);
+      }
+      try {
+        this.#endpoint.postMessage(
+          {type: 'batch', messages},
+          allTransfers.length > 0 ? allTransfers : undefined,
+        );
+      } catch (error) {
+        rejectFlushed(error);
+      }
+    }
   }
 
   /**
@@ -181,9 +249,11 @@ export class Connection {
   }
 
   /**
-   * Reject all pending calls/promises so callers don't hang indefinitely.
+   * Drop unsent batched messages and reject all pending calls/promises.
    */
   #dropPendingWork(reason: string): void {
+    this.#queue = [];
+    this.#flushScheduled = false;
     const err = new Error(reason);
     for (const {reject} of this.#pendingCalls.values()) {
       reject(err);
@@ -748,12 +818,23 @@ export class Connection {
   // Message handling
   // ============================================================
 
-  #onMessage = async (event: MessageEvent<Message>): Promise<void> => {
-    const message = event.data;
-    if ((message as unknown) == null) {
-      return;
-    }
+  #onMessage = (event: MessageEvent<Message | BatchMessage>): void => {
+    const data = event.data;
+    // Some MessagePort implementations can deliver null/undefined data
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (data == null) return;
 
+    // Unconditionally handle batch messages from any sender
+    if (data.type === 'batch') {
+      for (const message of data.messages) {
+        this.#processMessage(message);
+      }
+    } else {
+      this.#processMessage(data);
+    }
+  };
+
+  #processMessage(message: Message): void {
     switch (message.type) {
       case 'release': {
         // Unified release for both proxies and handles
@@ -785,7 +866,7 @@ export class Connection {
         this.#rejectPending(this.#pendingCalls, message.id, message.error);
         break;
       case 'call':
-        await this.#handleCall(message);
+        void this.#handleCall(message);
         break;
       case 'handler':
         this.#handleHandlerMessage(message.wireType, message.payload);
@@ -794,7 +875,7 @@ export class Connection {
         // Exhaustiveness check
         message satisfies never;
     }
-  };
+  }
 
   #settlePending(
     map: Map<number, PendingCall>,

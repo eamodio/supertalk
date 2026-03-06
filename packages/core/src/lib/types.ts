@@ -307,6 +307,18 @@ export interface HandlerMessage {
 }
 
 /**
+ * A batch of messages coalesced into a single postMessage call.
+ *
+ * This is a transport-level wrapper, not a logical message type.
+ * The receiver unpacks it and processes each message individually.
+ * Not part of the Message union — handled before dispatch.
+ */
+export interface BatchMessage {
+  type: 'batch';
+  messages: Array<Message>;
+}
+
+/**
  * Serialized error format for transmission.
  */
 export interface SerializedError {
@@ -373,6 +385,23 @@ export interface Options {
    * ```
    */
   handlers?: Array<Handler>;
+
+  /**
+   * Enable message batching.
+   *
+   * When `true`, outgoing messages are queued and coalesced within a microtask.
+   * Multiple calls made synchronously are sent in a single `postMessage`,
+   * reducing structured-clone and message-event overhead.
+   *
+   * Single messages are sent unwrapped (no batch overhead).
+   * Only 2+ messages in the same microtask get a batch wrapper.
+   *
+   * The receiving side always handles batch messages regardless of this option,
+   * so only the sending side needs to opt in.
+   *
+   * @default false
+   */
+  batching?: boolean;
 
   /**
    * Optional logger for RPC call tracing, diagnostics, and error reporting.
