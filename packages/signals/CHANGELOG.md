@@ -1,5 +1,13 @@
 # @supertalk/signals
 
+## 0.0.6
+
+### Patch Changes
+
+- 868e7b8: Fork and republish under @eamodio scope
+- Updated dependencies [868e7b8]
+  - @eamodio/supertalk-core@0.0.6
+
 ## 0.0.5
 
 ### Patch Changes
