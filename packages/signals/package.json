@@ -1,6 +1,6 @@
 {
   "name": "@eamodio/supertalk-signals",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "TC39 Signals integration for Supertalk",
   "type": "module",
   "exports": {
@@ -58,7 +58,9 @@
     "Supertalk"
   ],
   "author": "Eric Amodio",
-  "contributors": ["Justin Fagnani"],
+  "contributors": [
+    "Justin Fagnani"
+  ],
   "license": "MIT",
   "homepage": "https://github.com/eamodio/supertalk/tree/main/packages/signals#readme",
   "repository": {
@@ -73,7 +75,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@eamodio/supertalk-core": "^0.0.5"
+    "@eamodio/supertalk-core": "^0.0.6"
   },
   "peerDependencies": {
     "signal-polyfill": "^0.2.0"
