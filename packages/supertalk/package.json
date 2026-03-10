@@ -1,6 +1,6 @@
 {
   "name": "@eamodio/supertalk",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Type-safe client/server communication for workers, iframes, and RPC",
   "type": "module",
   "exports": {
@@ -55,7 +55,9 @@
     "typescript"
   ],
   "author": "Eric Amodio",
-  "contributors": ["Justin Fagnani"],
+  "contributors": [
+    "Justin Fagnani"
+  ],
   "license": "MIT",
   "homepage": "https://github.com/eamodio/supertalk#readme",
   "repository": {
@@ -70,7 +72,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@eamodio/supertalk-core": "0.0.5"
+    "@eamodio/supertalk-core": "0.0.6"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

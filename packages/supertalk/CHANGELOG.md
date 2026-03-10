@@ -1,5 +1,13 @@
 # supertalk
 
+## 0.0.7
+
+### Patch Changes
+
+- d7301c8: Fork and republish under @eamodio scope
+- Updated dependencies [d7301c8]
+  - @eamodio/supertalk-core@0.0.6
+
 ## 0.0.6
 
 ### Patch Changes

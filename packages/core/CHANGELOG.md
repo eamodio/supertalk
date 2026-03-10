@@ -1,5 +1,11 @@
 # @supertalk/core
 
+## 0.0.6
+
+### Patch Changes
+
+- d7301c8: Fork and republish under @eamodio scope
+
 ## 0.0.5
 
 ### Patch Changes
