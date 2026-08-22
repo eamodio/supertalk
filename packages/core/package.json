@@ -16,6 +16,10 @@
       "types": "./handlers/streams.d.ts",
       "default": "./handlers/streams.js"
     },
+    "./handlers/channel.js": {
+      "types": "./handlers/channel.d.ts",
+      "default": "./handlers/channel.js"
+    },
     "./handlers/abort-signal.js": {
       "types": "./handlers/abort-signal.d.ts",
       "default": "./handlers/abort-signal.js"

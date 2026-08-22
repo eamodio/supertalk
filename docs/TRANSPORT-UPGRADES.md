@@ -138,10 +138,10 @@ existing `logger` option (no new API):
 
 ### Size impact
 
-Estimate ~150–250 B brotli in the barrel: one exported function, the `Notify<T>` type (free),
-a symbol branch in the remote-proxy `get` trap, and one `if` in `#handleCall`. The notifier
-factory lives in `lib/notify.ts` and is reachable only from `notify()`, so consumers who
-never import it shed it.
+Measured: **+230 B brotli** in the barrel (3.22 kB → 3.45 kB), against an estimate of
+150–250 B. That covers one exported function, the `Notify<T>` type (free), a symbol branch in
+the remote-proxy `get` trap, and one `if` in `#handleCall`. The notifier factory lives in
+`lib/notify.ts` and is reachable only from `notify()`, so consumers who never import it shed it.
 
 ### Tests
 
@@ -301,8 +301,10 @@ promise it does not own; the only ways to stop an unhandled rejection are to nev
 
 ### Size impact
 
-Estimate ~250–400 B brotli: `lib/subscription.ts` plus the `_onReady` hook and
-`ConnectionClosedError`. Only the hook and the error class are unconditional.
+Measured: **+550 B brotli** in the barrel (3.45 kB → 4.00 kB), over an estimate of 250–400 B.
+That is `lib/subscription.ts` plus the `_onReady` hook and `ConnectionClosedError`; only the
+hook and the error class are unconditional, and `subscription.ts` tree-shakes away for
+consumers who never call `subscribe()`.
 
 ### Tests
 
@@ -385,16 +387,16 @@ export interface ChannelGap {
   generation: number;
   /** The seq the receiver expected. */
   expected: number;
-  /** The seq it actually got. */
+  /** The seq that first exposed the gap. */
   received: number;
-  /** True when a replay was attempted and the sender no longer had the messages. */
-  unrecoverable: boolean;
 }
 
 export class SequencedChannel<T> implements Handler<never, never> {
   constructor(name: string, options?: SequencedChannelOptions);
   readonly wireType: string; // `st:ch:${name}`
-  readonly generation: number; // outbound epoch
+  get generation(): number; // outbound epoch
+  get connected(): boolean;
+  get gapped(): boolean; // inbound: waiting on recovery
   send(value: T): void;
   newGeneration(): number;
   subscribe(listener: (value: T, meta: ChannelMeta) => void): () => void;
@@ -406,30 +408,63 @@ One instance per channel per side; register it in `handlers` on both sides. Inst
 symmetric — each tracks its own outbound sequence and its own inbound expectation, so a
 channel can flow both ways.
 
+### One gap event, only when the channel cannot self-heal
+
+There is no `unrecoverable` flag on `ChannelGap` — `onGap` itself only fires once recovery has
+already failed. On detecting a gap, the receiver sends a replay request and waits: if the
+sender can replay, the missing messages arrive and delivery resumes with **no** gap event at
+all — the application never learns the gap happened. Only if the sender answers "miss" does
+the receiver emit `onGap`, and it stays gapped until the application calls `newGeneration()`.
+
+Rationale: one event per gap rather than one per detection-that-might-self-heal, no false
+alarms for a hole that repairs itself, and a successful replay costs the application nothing.
+
+This has two costs. A gap is reported one round trip later than it is detected, since the
+receiver has to hear back from the sender before it knows recovery failed. And if the replay
+request or its response is lost in transit — the case that matters in practice is a hidden
+VS Code webview, which silently drops `postMessage` to a retained-but-invisible view — the
+first repair attempt fails silently. That stall is bounded, not permanent: the next arriving
+message that advances past the highest seq seen while gapped re-issues the request, so a lost
+round trip costs one extra message of delay rather than stalling the channel until the next
+connect.
+
 ### Receiver state machine
 
 Given inbound `{g, s, v}` against `(curGen, expected)`:
 
-| Condition                        | Action                                                                    |
-| -------------------------------- | ------------------------------------------------------------------------- |
-| `g > curGen`                     | Adopt generation, clear any gap, deliver, `expected = s + 1`              |
-| `g < curGen`                     | Drop (stale in-flight from before an epoch bump)                          |
-| `g === curGen`, `s === expected` | Deliver, `expected++` (also how a replay resumes a gapped channel)        |
-| `g === curGen`, `s > expected`   | **Gap.** Stop delivering. Request replay if configured, else emit `onGap` |
-| `g === curGen`, `s < expected`   | Drop (duplicate)                                                          |
+| Condition                                                                                   | Action                                                                                                       |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `g > curGen`, `s === 0`                                                                     | Adopt generation, clear any gap, deliver, `expected = 1`                                                     |
+| `g > curGen`, `s > 0`                                                                       | Adopt generation **without delivering** — a mid-stream join. Gap, `expected = 0`, request replay of `{r: 0}` |
+| `g < curGen`                                                                                | Drop (stale in-flight from before an epoch bump)                                                             |
+| `g === curGen`, `s === expected`                                                            | Deliver, `expected++` (also how a replay resumes a gapped channel)                                           |
+| `g === curGen`, `s > expected`                                                              | **Gap.** Stop delivering and request a replay from `expected`; `onGap` fires only on a miss answer           |
+| `g === curGen`, gapped, `s > expected`, `s` advances past the highest seq seen while gapped | Re-request the replay — repairs a lost request or response without a second `onGap`                          |
+| `g === curGen`, `s < expected`                                                              | Drop (duplicate)                                                                                             |
 
 While gapped, same-generation messages are dropped rather than delivered out of order — the
 guarantee is "every message in order, or an event". The channel leaves the gapped state on a
 successful replay or on a new generation.
 
+Adopting a generation from a data message rather than the epoch announcement is itself a
+potential gap: if the announcement and the new generation's own early messages were dropped
+while the receiver was unreachable, the first surviving message can carry `s > 0`. The
+receiver no longer treats that as an ordinary fresh start — starting mid-stream would silently
+skip whatever the domain sent first (typically a resync snapshot at seq 0). Instead it adopts
+the generation, does not deliver, and requests a replay from seq 0, exactly as it would for an
+in-generation gap: heal invisibly if the sender's buffer covers seq 0, or report `onGap` on a
+miss.
+
 ### Replay
 
-With `replay: N` on the sender, a gap sends `{r: expected}` back. The sender resends every
-buffered entry with `seq >= expected` (in order), and the receiver resumes at `expected` with
-no application involvement. If the buffer no longer covers `expected`, the sender answers
-`{m: expected}` and the receiver emits `onGap({unrecoverable: true})` and stays gapped until
-the application drives a `newGeneration()`. Without `replay`, every gap goes straight to
-`onGap`.
+With `replay: N` on the sender, a gap sends `{g: generation, r: expected}` back. The sender
+resends every buffered entry with `seq >= expected` (in order), and the receiver resumes at
+`expected` with no application involvement — and no `onGap` event. If the buffer no longer
+covers `expected` — or the sender has already moved past the requested generation — it answers
+a miss echoing the request, `{g, m}`. The receiver only honors a miss that matches its open
+gap's generation and expected seq, and a matching miss fires `onGap` exactly once per gap; the
+channel stays gapped until the application drives a `newGeneration()`. Without `replay`, the
+buffer is always empty, so every gap goes straight to a miss and `onGap`.
 
 ### Wire protocol
 
@@ -439,8 +474,9 @@ no-ops on an unknown `wireType`). Payload shapes, keyed short because they are p
 
 ```jsonc
 {"g": 3, "s": 128, "v": <value>}   // data
-{"r": 129}                          // replay request (receiver → sender)
-{"m": 129}                          // replay miss (sender → receiver)
+{"g": 4, "e": 1}                    // epoch announcement (newGeneration(), sender → receiver)
+{"g": 3, "r": 129}                  // replay request (receiver → sender)
+{"g": 3, "m": 129}                  // replay miss (sender → receiver, echoing the request)
 ```
 
 Values pass through `toWire`/`fromWire`, so proxies, transfers, and custom handlers work
@@ -459,28 +495,39 @@ inside a channel payload.
 
 ### Size impact
 
-Zero in the core barrel — separate entry point, like `handlers/streams.js`. Estimate ~500 B
-brotli standalone.
+Measured: **zero** in the core barrel — it is a separate entry point, like
+`handlers/streams.js`, and the barrel is unchanged by it. Standalone the channel bundles
+to **856 B brotli**, over an estimate of ~500 B; `checksize` reports it as its own bundle so
+the opt-in's cost stays visible.
 
 ### Tests
 
 Node (`channel_test.ts`):
 
 1. Ordered delivery; `meta.seq` increments; `meta.generation` is stable.
-2. Gap detection: with a lossy endpoint that drops one message, the receiver emits `onGap`
-   with the right `expected`/`received` and delivers nothing further.
-3. Replay repairs a gap end-to-end, delivering the dropped message in order (`replay: N`).
-4. Replay miss (drop older than the buffer) emits `onGap({unrecoverable: true})`.
-5. `newGeneration()` resets seq, clears a gapped receiver, and delivers again.
-6. Messages from an older generation arriving after a bump are dropped.
-7. Duplicate seq is dropped.
-8. Bidirectional use on a single pair of instances.
-9. Batching: N `send()`s in one microtask = one `postMessage`, order preserved.
-10. Reconnect: `reset()` + re-expose starts a new generation and the receiver resyncs without
+2. Gap with no replay configured: a dropped message surfaces `onGap` only after the miss round
+   trip, and nothing further is delivered.
+3. Replay repairs a gap end-to-end: no `onGap` event, and every message is delivered in order
+   (`replay: N`).
+4. Replay miss — a drop older than the replay buffer — emits `onGap`.
+5. Cross-generation gap (mid-stream join): adopting a generation from a data message with
+   `s > 0` heals via replay with no `onGap` event, when the sender's buffer covers seq 0.
+6. Cross-generation gap (mid-stream join) with no replay coverage: reports exactly one
+   `onGap`, and nothing from the new generation is delivered.
+7. A lost replay re-arms recovery: dropping both the live message and the sender's replayed
+   copy leaves the channel gapped with nothing delivered and no `onGap`; the next live message
+   re-issues the replay request and heals the channel with every message delivered in order.
+8. `newGeneration()` resets seq, clears a gapped receiver, and delivers again.
+9. Messages from an older generation arriving after a bump are dropped.
+10. Duplicate seq is dropped.
+11. Bidirectional use on a single pair of instances.
+12. Batching: N `send()`s in one microtask = one `postMessage`, order preserved.
+13. Reconnect: `reset()` + re-expose starts a new generation and the receiver resyncs without
     a gap event.
-11. Multiple `subscribe()` listeners; unsubscribe stops one without affecting the other.
+14. Multiple `subscribe()` listeners; unsubscribe stops one without affecting the other.
 
-Browser (`channel_test.ts`): ordered delivery plus one gap case over a `MessageChannel`.
+Browser (`channel_test.ts`): ordered delivery, one in-generation gap case, and one
+cross-generation (mid-stream join) gap case, over a `MessageChannel`.
 
 ### Consumer migration note
 
@@ -518,8 +565,20 @@ Each milestone is code + node tests + browser tests + a changeset, and leaves `n
 `npm test`, `npm run lint`, `npm run format:check`, and `npm run checksize` green before the
 next begins.
 
-| M   | Contents                                                                                                |
-| --- | ------------------------------------------------------------------------------------------------------- |
-| M1  | P1a `notify()`; internal-symbol hook on remote proxies; minimal checksize input                         |
-| M2  | P1b `subscribe()`/`Subscription`; `Connection._onReady`; P2b `ConnectionClosedError` + `Symbol.dispose` |
-| M3  | P1c `SequencedChannel` + `./handlers/channel.js` export                                                 |
+| M   | Contents                                                                                                | Status                                  |
+| --- | ------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| M1  | P1a `notify()`; internal-symbol hook on remote proxies; minimal checksize input                         | Landed — `[core] Add notify()…`         |
+| M2  | P1b `subscribe()`/`Subscription`; `Connection._onReady`; P2b `ConnectionClosedError` + `Symbol.dispose` | Landed — `[core] Add subscribe()…`      |
+| M3  | P1c `SequencedChannel` + `./handlers/channel.js` export                                                 | Landed — `[core] Add SequencedChannel…` |
+
+Final bundle report (`npm run checksize`), against a 3.22 kB brotli pre-work barrel:
+
+| Bundle                         | Raw      | Gzip    | Brotli  |
+| ------------------------------ | -------- | ------- | ------- |
+| `index.js` (full barrel)       | 13.93 kB | 4.64 kB | 4.19 kB |
+| `minimal.js` (`expose`/`wrap`) | 10.76 kB | 3.70 kB | 3.35 kB |
+| `channel.js` (opt-in)          | 2.53 kB  | 986 B   | 856 B   |
+
+The `minimal.js` figure has no pre-work counterpart — the input was added in M1 — so read it as
+"what a consumer who imports only `expose`/`wrap` pays today", including the unconditional
+`Connection` hooks from M1 and M2 but none of the opt-in modules.

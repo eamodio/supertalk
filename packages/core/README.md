@@ -494,6 +494,38 @@ For handlers that need to send updates outside of RPC calls (like signals or obs
 
 See [@supertalk/signals](../signals) for a complete example.
 
+**Sequenced channels:**
+
+`SequencedChannel<T>`, from the separate `@eamodio/supertalk-core/handlers/channel.js` entry
+point, guarantees ordered delivery for a one-way stream of values, with receiver-side gap
+detection and sender-side generations (epochs).
+
+```ts
+import {SequencedChannel} from '@eamodio/supertalk-core/handlers/channel.js';
+
+// Sender
+const rows = new SequencedChannel<RowSplice>('rows', {replay: 32});
+expose(service, endpoint, {handlers: [rows]});
+rows.send(splice); // stamped {generation, seq}
+rows.newGeneration(); // epoch bump: resets seq, clears replay, invalidates in-flight
+
+// Receiver
+const rows = new SequencedChannel<RowSplice>('rows');
+const connection = new Connection(endpoint, {handlers: [rows]});
+rows.subscribe((splice, meta) => ledger.apply(splice)); // in-order only
+rows.onGap((gap) => void service.resyncRows()); // domain recovery is the app's
+```
+
+Guarantee: every value is delivered in order, or `onGap` fires — never both, never neither.
+`onGap` only fires when the channel can't self-heal: a gap first triggers a replay request, and
+if `replay: N` lets the sender resend the missing messages, delivery resumes with no `onGap` at
+all. Create one instance per channel per side and register it in `handlers` on both ends; the
+library owns ordering and gap detection, and the application owns domain recovery — what a
+resync sends, and calling `newGeneration()` when it does.
+
+It is a separate entry point, like `handlers/streams.js`: importing it adds nothing to the main
+bundle unless you actually use it.
+
 ### TypeScript Types
 
 #### `Remote<T>`

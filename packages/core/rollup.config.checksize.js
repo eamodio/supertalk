@@ -49,4 +49,14 @@ export default [
     },
     plugins,
   },
+  {
+    // The sequenced-channel opt-in on its own — it is a separate entry point,
+    // so this is what importing it costs on top of the bundles above.
+    input: 'handlers/channel.js',
+    output: {
+      file: '.checksize/channel.js',
+      format: 'es',
+    },
+    plugins,
+  },
 ];
