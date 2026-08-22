@@ -1,5 +1,14 @@
 # @supertalk/signals
 
+## 0.0.7
+
+### Patch Changes
+
+- Updated dependencies [2a8b195]
+- Updated dependencies [46ad2d7]
+- Updated dependencies [d874de8]
+  - @eamodio/supertalk-core@0.1.0
+
 ## 0.0.6
 
 ### Patch Changes

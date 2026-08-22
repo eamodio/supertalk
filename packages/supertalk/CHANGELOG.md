@@ -1,5 +1,68 @@
 # supertalk
 
+## 0.1.0
+
+### Minor Changes
+
+- 2a8b195: Add `notify()` for one-way, fire-and-forget calls against a remote proxy.
+
+  A notify sends a single wire message — a `CallMessage` stamped with the reserved
+  sentinel `id: -1` — and never waits for or registers a response, so an event
+  emission or a fire-and-forget write costs one message instead of two, and there
+  is no unawaited promise to leak as an unhandled rejection. Errors on either side
+  (serialization failures on the sender, a throwing handler on the receiver)
+  surface through the connection's `logger` option instead.
+
+  An old (pre-`notify()`) receiver still executes the call correctly; it just
+  replies with an unneeded `return`/`throw` that the new sender silently drops,
+  degrading to today's two-message cost rather than losing the call.
+
+- 46ad2d7: Add `SequencedChannel` for ordered delivery with gap detection and generations.
+
+  `SequencedChannel<T>`, from the new `@eamodio/supertalk-core/handlers/channel.js`
+  entry point, guarantees every value is delivered in order or an `onGap` event
+  fires — never both, and never neither. Each side registers one instance per
+  channel in `handlers`; instances are symmetric, so a single pair can carry
+  traffic both ways. `newGeneration()` bumps a sender-side epoch, invalidating
+  stale in-flight messages and resetting the receiver's gap state.
+
+  `onGap` fires exactly once per gap, only when the channel cannot self-heal: on
+  detecting a gap the receiver requests a replay and waits; if the sender still
+  has the messages (`{replay: N}`), they resend and delivery resumes with no gap
+  event; only a replay miss surfaces `onGap`. The cost is one round trip of
+  latency before a genuine gap is reported, and — if the replay request or its
+  response is lost in transit — the next message that advances past the gap
+  re-issues the request, so recovery costs at most one extra message of delay
+  rather than stalling until the next connect.
+
+  It is a separate entry point, like `handlers/streams.js`: importing it costs
+  nothing in the main bundle unless a consumer actually uses it.
+
+- d874de8: Add `subscribe()` for synchronous subscription handles, and `ConnectionClosedError` for deliberate-teardown call settlement.
+
+  `subscribe(target, subscriber)` returns a `Subscription` handle immediately and
+  buffers the wire subscribe call internally until the connection's handshake
+  completes, so a consumer can subscribe from a constructor without awaiting
+  anything. The library re-invokes the subscriber on every subsequent handshake
+  (after a `reset()` + `waitForReady()` reconnect), so the application no longer
+  re-subscribes by hand; `subscription.unsubscribe()` releases the remote side
+  and cancels resubscription, and `Subscription` implements `Symbol.dispose` for
+  `using`.
+
+  `close()` and `reset()` now reject in-flight calls and promises with a new
+  `ConnectionClosedError` (carrying `reason: 'closed' | 'reset'`) instead of a
+  bare `Error`, so consumers can filter deliberate teardown from a real failure.
+  `subscribe()` relies on this internally to swallow teardown/reset failures
+  rather than logging them. `Connection` also gains `[Symbol.dispose]()` (calls
+  `close()`) for `using`.
+
+### Patch Changes
+
+- Updated dependencies [2a8b195]
+- Updated dependencies [46ad2d7]
+- Updated dependencies [d874de8]
+  - @eamodio/supertalk-core@0.1.0
+
 ## 0.0.7
 
 ### Patch Changes
