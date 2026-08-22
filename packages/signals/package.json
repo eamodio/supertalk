@@ -1,6 +1,6 @@
 {
   "name": "@eamodio/supertalk-signals",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "TC39 Signals integration for Supertalk",
   "type": "module",
   "exports": {
@@ -75,7 +75,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@eamodio/supertalk-core": "^0.0.6"
+    "@eamodio/supertalk-core": "^0.1.0"
   },
   "peerDependencies": {
     "signal-polyfill": "^0.2.0"
