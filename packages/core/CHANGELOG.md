@@ -1,5 +1,11 @@
 # @supertalk/core
 
+## 0.1.1
+
+### Patch Changes
+
+- 4712c23: Log dropped one-way calls for unknown proxy targets at debug level
+
 ## 0.1.0
 
 ### Minor Changes

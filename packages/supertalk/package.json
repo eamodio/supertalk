@@ -1,6 +1,6 @@
 {
   "name": "@eamodio/supertalk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Type-safe client/server communication for workers, iframes, and RPC",
   "type": "module",
   "exports": {
@@ -72,7 +72,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@eamodio/supertalk-core": "0.1.0"
+    "@eamodio/supertalk-core": "0.1.1"
   },
   "devDependencies": {
     "typescript": "^5.7.2"
