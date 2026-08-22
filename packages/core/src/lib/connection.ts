@@ -1226,7 +1226,16 @@ export class Connection {
         message: `Proxy target ${String(target)} not found`,
       };
       if (oneWay) {
-        this.#logger?.error?.('Proxy target not found for notify', error);
+        // Expected protocol debris, not a failure: a one-way call has no reply
+        // channel, and a missing target routinely means this side reset()
+        // (restarting its registry from id 0) while the peer's sends were
+        // already in flight — the peer only learns of the new session at the
+        // next handshake, which re-issues subscriptions anyway. Log at debug
+        // so a genuine leak is still diagnosable without paging every reset.
+        this.#logger?.debug?.(
+          'Dropping one-way call for unknown proxy target (peer likely reset)',
+          error,
+        );
         return;
       }
       return this.#post({type: 'throw', id, error});
