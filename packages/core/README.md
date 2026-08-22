@@ -96,6 +96,39 @@ All functions are transformed into promise-returning async functions on the
 wrapped side. Proxies are released from memory when they're no longer in use by
 the wrapped side.
 
+### One-way calls with `notify()`
+
+Every regular call is request/response — even when nothing needs the reply.
+`notify()` wraps a remote proxy (or a callback proxy received as an argument)
+so calling it sends a single wire message with no response and returns `void`,
+instead of a `Promise` nobody awaits:
+
+```ts
+import {notify} from '@supertalk/core';
+
+// Method calls on a remote object
+notify(remote).reportSelection(ids); // void — one wire message, no ack
+```
+
+```ts
+// A callback proxy received from the other side (the event-emission case)
+class Service {
+  onDidChange(cb: (e: Change) => void) {
+    const emit = notify(cb); // hoist once
+    this.#listeners.add(emit);
+    return () => this.#listeners.delete(emit);
+  }
+}
+```
+
+Hoist the notifier out of hot loops, the same way you'd hoist `remote.method`.
+Errors — a throwing handler, a serialization failure — are reported through
+the `logger` option on whichever side produced them, never as a rejection.
+`notify()` throws `TypeError` if `target` isn't a remote proxy (a `handle()`,
+for example, has no callable surface). Don't pass per-call resources like
+`AbortSignal` through `notify()`: a handler that releases on call settlement
+never gets told to, since a notify never settles.
+
 ### Object proxying with `proxy()`
 
 Objects are cloned by default. This works well for immutable data objects, but

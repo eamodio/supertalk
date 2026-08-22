@@ -19,11 +19,13 @@ import type {
   AsyncProxy,
   Handle,
 } from './types.js';
+import type {Connection} from './connection.js';
 import {
   PROXY_VALUE,
   PROXY_PROPERTY_BRAND,
   TRANSFER,
   NON_CLONEABLE,
+  INTERNAL,
 } from './constants.js';
 
 /**
@@ -389,6 +391,24 @@ export function deserializeError(serialized: SerializedError): Error {
   // @ts-expect-error Stack is writable
   error.stack = serialized.stack;
   return error;
+}
+
+/**
+ * Read the owning `Connection` off a remote proxy via the `INTERNAL`
+ * symbol. Returns `undefined` for anything that is not a remote proxy.
+ * Shared by `notify()` and `subscribe()`.
+ * @internal
+ */
+export function connectionOf(value: unknown): Connection | undefined {
+  if (
+    value === null ||
+    (typeof value !== 'object' && typeof value !== 'function')
+  ) {
+    return undefined;
+  }
+  return (value as Record<PropertyKey, unknown>)[INTERNAL] as
+    | Connection
+    | undefined;
 }
 
 /**

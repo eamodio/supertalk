@@ -35,6 +35,8 @@ import {
   WIRE_TYPE,
   HANDSHAKE_ID,
   NON_CLONEABLE,
+  NOTIFY_ID,
+  INTERNAL,
 } from './constants.js';
 import {
   isProxyMarker,
@@ -174,6 +176,7 @@ export class Connection {
     // If postMessage throws (e.g. structured-clone failure), reject any pending
     // calls whose messages are in this batch so callers don't hang indefinitely.
     const rejectFlushed = (error: unknown): void => {
+      this.#logger?.error?.('Failed to post message', error);
       const err = error instanceof Error ? error : new Error(String(error));
       for (const {message} of queue) {
         const msg = message as {type?: string; id?: number};
@@ -421,6 +424,24 @@ export class Connection {
    */
   #getRemoteProxyId(obj: object): number | undefined {
     return this.#remoteProxyByObject.get(obj);
+  }
+
+  /**
+   * Get the remote ID for a proxy, if it exists.
+   * @internal
+   */
+  _proxyId(obj: object): number | undefined {
+    return this.#getRemoteProxyId(obj);
+  }
+
+  /**
+   * The current session id — captured by `notify()` so a notifier from a
+   * previous session (before a `reset()`) fails like a stale proxy instead
+   * of silently targeting a reused id.
+   * @internal
+   */
+  get _session(): number {
+    return this.#sessionId;
   }
 
   // ============================================================
@@ -801,11 +822,13 @@ export class Connection {
               return this.#makeCall(id, undefined, args);
             },
 
-            get: (_target, prop) =>
+            get: (_target, prop) => {
+              if (prop === INTERNAL) return this;
               // Not thenable at top level (prevents auto-await issues)
-              typeof prop === 'string' && prop !== 'then'
+              return typeof prop === 'string' && prop !== 'then'
                 ? this.#createProxyProperty(id, prop, session)
-                : undefined,
+                : undefined;
+            },
 
             set: (_target, prop, value) => {
               if (typeof prop !== 'string') return false;
@@ -925,6 +948,42 @@ export class Connection {
       ),
       transfers,
     );
+  }
+
+  /**
+   * Send a one-way call (no response expected, nothing to settle).
+   * Failures are caught and logged rather than thrown — the API is void.
+   * @internal
+   */
+  _sendNotify(
+    target: number,
+    method: string | undefined,
+    args: Array<unknown>,
+    session: number,
+  ): void {
+    this.#assertSession(session);
+    try {
+      const transfers: Array<Transferable> = [];
+      // Share seen map across all args to preserve identity for shared
+      // references. No callId — a notify has nothing to settle.
+      const seen = new Map<object, unknown>();
+      const wireArgs = args.map((arg) =>
+        this.#processForClone(arg, '', transfers, seen),
+      );
+      this.#post(
+        {
+          type: 'call',
+          id: NOTIFY_ID,
+          target,
+          action: 'call',
+          method,
+          args: wireArgs,
+        },
+        transfers,
+      );
+    } catch (error) {
+      this.#logger?.error?.('Failed to send notify', error);
+    }
   }
 
   // ============================================================
@@ -1053,6 +1112,7 @@ export class Connection {
 
   async #handleCall(message: CallMessage): Promise<void> {
     const {id, target, method, args, action} = message;
+    const oneWay = id === NOTIFY_ID;
 
     // Deserialize arguments with shared seen map to preserve identity
     const seen = new Map<object, unknown>();
@@ -1063,14 +1123,15 @@ export class Connection {
     // Look up the target object
     const proxyTarget = this.#getLocal(target);
     if (!proxyTarget) {
-      return this.#post({
-        type: 'throw',
-        id,
-        error: {
-          name: 'ReferenceError',
-          message: `Proxy target ${String(target)} not found`,
-        },
-      });
+      const error = {
+        name: 'ReferenceError',
+        message: `Proxy target ${String(target)} not found`,
+      };
+      if (oneWay) {
+        this.#logger?.error?.('Proxy target not found for notify', error);
+        return;
+      }
+      return this.#post({type: 'throw', id, error});
     }
 
     const logger = this.#logger;
@@ -1111,9 +1172,11 @@ export class Connection {
         );
       }
 
-      const transfers: Array<Transferable> = [];
-      const wire = this.#toWire(result, '', transfers);
-      this.#post({type: 'return', id, value: wire}, transfers);
+      if (!oneWay) {
+        const transfers: Array<Transferable> = [];
+        const wire = this.#toWire(result, '', transfers);
+        this.#post({type: 'return', id, value: wire}, transfers);
+      }
       logger?.debug?.(`${action} ${method ?? '(direct)'} completed`, {
         duration: performance.now() - start,
       });
@@ -1122,6 +1185,10 @@ export class Connection {
         duration: performance.now() - start,
         error,
       });
+      if (oneWay) {
+        logger?.error?.('Uncaught error in notify handler', error);
+        return;
+      }
       this.#post({type: 'throw', id, error: serializeError(error)});
     }
   }

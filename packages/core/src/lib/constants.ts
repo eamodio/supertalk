@@ -44,3 +44,15 @@ export const HANDSHAKE_ID = 0;
  * as arguments. The value contains the target proxy ID and property name.
  */
 export const PROXY_PROPERTY_BRAND = Symbol();
+
+/**
+ * Reserved CallMessage id meaning "one-way, do not respond".
+ * Real call ids are non-negative; 0 is the handshake (HANDSHAKE_ID).
+ */
+export const NOTIFY_ID = -1;
+
+/**
+ * Internal symbol. Reading it off a remote proxy yields the owning
+ * Connection. Not exported from the package barrel.
+ */
+export const INTERNAL = Symbol();

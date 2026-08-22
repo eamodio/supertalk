@@ -13,26 +13,40 @@ import {nodeResolve} from '@rollup/plugin-node-resolve';
 import terser from '@rollup/plugin-terser';
 import summary from 'rollup-plugin-summary';
 
-export default {
-  input: 'index.js',
-  output: {
-    file: '.checksize/index.js',
-    format: 'es',
+const plugins = [
+  nodeResolve(),
+  terser({
+    ecma: 2024,
+    module: true,
+    compress: {
+      passes: 2,
+      pure_getters: true,
+    },
+  }),
+  summary({
+    showMinifiedSize: true,
+    showGzippedSize: true,
+    showBrotliSize: true,
+  }),
+];
+
+export default [
+  {
+    input: 'index.js',
+    output: {
+      file: '.checksize/index.js',
+      format: 'es',
+    },
+    plugins,
   },
-  plugins: [
-    nodeResolve(),
-    terser({
-      ecma: 2024,
-      module: true,
-      compress: {
-        passes: 2,
-        pure_getters: true,
-      },
-    }),
-    summary({
-      showMinifiedSize: true,
-      showGzippedSize: true,
-      showBrotliSize: true,
-    }),
-  ],
-};
+  {
+    // Only expose/wrap — measures what a consumer who ignores newer barrel
+    // exports (e.g. notify) actually pays.
+    input: 'checksize-minimal.js',
+    output: {
+      file: '.checksize/minimal.js',
+      format: 'es',
+    },
+    plugins,
+  },
+];

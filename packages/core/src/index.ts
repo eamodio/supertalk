@@ -10,6 +10,8 @@
 export {expose} from './lib/expose.js';
 export {wrap} from './lib/wrap.js';
 export {Connection} from './lib/connection.js';
+export {notify} from './lib/notify.js';
+export type {Notify} from './lib/notify.js';
 
 // Proxy, handle, and transfer markers
 export {

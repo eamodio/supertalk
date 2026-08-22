@@ -52,6 +52,7 @@
       "output": [
         "index.*",
         "node.*",
+        "checksize-minimal.*",
         "lib/**",
         "handlers/**",
         "test/**",
