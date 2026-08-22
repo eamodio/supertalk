@@ -242,6 +242,8 @@ Behavior:
   handshake. The old session's unsubscribe is discarded, not called — the peer's state is gone.
 - **Errors.** A failed subscribe is reported through `logger.error`. `ConnectionClosedError`
   (below) is swallowed rather than logged, since it means deliberate teardown.
+- **`ready` also settles when you unsubscribe before the subscribe lands**, so awaiting it
+  can never hang.
 
 Documented limits: only subscriptions anchored on the **root** proxy resurrect (proxies from a
 dead session are gone by definition), and the subscriber must be idempotent because it can run

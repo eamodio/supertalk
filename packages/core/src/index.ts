@@ -12,6 +12,8 @@ export {wrap} from './lib/wrap.js';
 export {Connection} from './lib/connection.js';
 export {notify} from './lib/notify.js';
 export type {Notify} from './lib/notify.js';
+export {subscribe} from './lib/subscription.js';
+export type {Subscription, Unsubscribe} from './lib/subscription.js';
 
 // Proxy, handle, and transfer markers
 export {
@@ -24,7 +26,7 @@ export {
 export type {TransferMarker} from './lib/protocol.js';
 
 // Utilities
-export {NonCloneableError} from './lib/protocol.js';
+export {NonCloneableError, ConnectionClosedError} from './lib/protocol.js';
 
 // Types
 export type {

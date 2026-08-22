@@ -129,6 +129,70 @@ for example, has no callable surface). Don't pass per-call resources like
 `AbortSignal` through `notify()`: a handler that releases on call settlement
 never gets told to, since a notify never settles.
 
+### Subscriptions with `subscribe()`
+
+Subscribing the plain way is `await remote.onEvent(cb)`, returning a
+`Promise<Unsubscribe>`. That races teardown and reconnect: every call site
+needs a staleness guard, and after a reconnect the application has to
+re-subscribe everything by hand. `subscribe()` returns a handle synchronously
+and buffers the wire subscribe call until the connection's handshake
+completes, so you can subscribe from a constructor and never `await`
+anything:
+
+```ts
+import {subscribe} from '@supertalk/core';
+
+class Panel {
+  // In a constructor. Nothing awaited. Survives reconnect.
+  #rows = subscribe(this.#connection, (remote) =>
+    remote.onDidChangeRows(this.#onRows),
+  );
+
+  dispose() {
+    this.#rows.unsubscribe();
+  }
+}
+```
+
+The `subscriber` thunk receives the current root proxy and does whatever
+subscribing means for that service; its return value, if a function, is
+treated as the remote unsubscribe. The library re-invokes it on every
+successful handshake — including after a `reset()` + `waitForReady()`
+reconnect — so the subscriber must be idempotent and must always re-derive
+whatever it subscribes on from the `remote` it's given. Only subscriptions
+anchored on the **root** proxy resurrect this way; a proxy from a dead
+session is gone by definition. When passing a bare `Connection`, the
+application still has to drive `waitForReady()` (or use `wrap()`) — that
+call is what signals ready and triggers delivery.
+
+```ts
+interface Subscription extends Disposable {
+  unsubscribe(): void; // idempotent; releases the remote side
+  readonly closed: boolean;
+  readonly ready: Promise<void>; // settles once the first subscribe lands
+}
+```
+
+`unsubscribe()` is idempotent and works even before the initial subscribe
+call has landed — the pending call's returned unsubscribe is invoked as soon
+as it arrives instead of being stored. `Subscription` implements
+`Symbol.dispose`, so `using` works too:
+
+```ts
+using rows = subscribe(connection, (remote) => remote.onDidChangeRows(cb));
+```
+
+`Subscription extends Disposable`, so a consuming project's `lib` must include
+`esnext.disposable` (`@types/node` pulls it in automatically).
+
+Failures — a throwing subscriber, a rejected `target` promise — are reported
+through the `logger` option and surface on `ready`. The exceptions are the
+`ConnectionClosedError`s that `close()`/`reset()` reject in-flight work with:
+neither is logged, since both mean deliberate teardown. A `reset()` is
+swallowed entirely — the next reconnect re-issues automatically — while a
+`close()` also settles a still-pending `ready` with the error, so awaiting
+it can never hang.
+
 ### Object proxying with `proxy()`
 
 Objects are cloned by default. This works well for immutable data objects, but

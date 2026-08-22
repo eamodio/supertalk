@@ -425,3 +425,21 @@ export class NonCloneableError extends Error {
     this.name = 'NonCloneableError';
   }
 }
+
+/**
+ * Error used to settle in-flight calls and promises when a connection is
+ * torn down deliberately — via `close()` or `reset()` — rather than by a
+ * real failure. Filter on `error instanceof ConnectionClosedError` to tell
+ * "this went away on purpose" apart from an actual error.
+ *
+ * Supertalk cannot swallow this for you: once it hands you a promise, it no
+ * longer owns it, and the only ways to stop an unhandled rejection are to
+ * never settle it (a hang) or settle it with a lie. So filter on the error
+ * type, or avoid holding the promise at all — use `notify()` instead.
+ */
+export class ConnectionClosedError extends Error {
+  constructor(public readonly reason: 'closed' | 'reset') {
+    super(reason === 'closed' ? 'Connection closed' : 'Connection reset');
+    this.name = 'ConnectionClosedError';
+  }
+}

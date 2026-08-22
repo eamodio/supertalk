@@ -47,6 +47,7 @@ import {
   serializeError,
   deserializeError,
   NonCloneableError,
+  ConnectionClosedError,
   proxy,
 } from './protocol.js';
 
@@ -90,6 +91,17 @@ export class Connection {
   #nextId = 0;
   #idStep = 1;
   #closed = false;
+
+  // Root proxy from the most recent successful handshake, and the callbacks
+  // to fan out to on every handshake (subscription bookkeeping lives in
+  // lib/subscription.ts; this is just the hook).
+  #root: object | undefined;
+  // Every proxy that has ever been the handshake root, across sessions —
+  // lets subscribe() tell a (possibly stale) root from a nested proxy after
+  // reset() has cleared the registries.
+  #rootProxies = new WeakSet<object>();
+  #readyCbs = new Set<(root: object) => void>();
+  #closedCbs = new Set<() => void>();
 
   // Local object registry (strong refs) - objects we expose to remote
   #localById = new Map<number, object>();
@@ -259,12 +271,13 @@ export class Connection {
   }
 
   /**
-   * Drop unsent batched messages and reject all pending calls/promises.
+   * Drop unsent batched messages and reject all pending calls/promises with
+   * a `ConnectionClosedError` carrying the given reason.
    */
-  #dropPendingWork(reason: string): void {
+  #dropPendingWork(reason: 'closed' | 'reset'): void {
     this.#queue = [];
     this.#flushScheduled = false;
-    const err = new Error(reason);
+    const err = new ConnectionClosedError(reason);
     for (const {reject} of this.#pendingCalls.values()) {
       reject(err);
     }
@@ -280,13 +293,33 @@ export class Connection {
    */
   close(): void {
     this.#closed = true;
-    this.#dropPendingWork('Connection closed');
+    this.#dropPendingWork('closed');
     this.#endpoint.removeEventListener('message', this.#onMessage);
+
+    // Clear the cached root so a later _onReady registration doesn't fire
+    // synchronously against a dead session, and notify closed-callbacks so a
+    // pending subscription `ready` settles instead of hanging.
+    this.#root = undefined;
+    for (const cb of this.#closedCbs) {
+      try {
+        cb();
+      } catch (error) {
+        this.#logger?.error?.('Error in _onClosed callback', error);
+      }
+    }
 
     // Call disconnect() on handlers that support it
     for (const handler of this.#handlers) {
       handler.disconnect?.();
     }
+  }
+
+  /**
+   * Enables `using connection = new Connection(...)` to close the
+   * connection automatically when the scope ends.
+   */
+  [Symbol.dispose](): void {
+    this.close();
   }
 
   /**
@@ -301,7 +334,11 @@ export class Connection {
    * re-added to the (new or existing) endpoint.
    */
   reset(endpoint?: Endpoint): void {
-    this.#dropPendingWork('Connection reset');
+    this.#dropPendingWork('reset');
+
+    // Clear the cached root — subscriptions must wait for the next ready
+    // rather than re-issuing against a dead root.
+    this.#root = undefined;
 
     // Clear local object registries
     this.#localById.clear();
@@ -375,12 +412,62 @@ export class Connection {
     // This ensures local IDs never collide with the expose side's even IDs.
     this.#nextId = 1;
     this.#idStep = 2;
-    return new Promise((resolve, reject) => {
-      this.#pendingCalls.set(HANDSHAKE_ID, {
-        resolve,
-        reject,
-      });
+    const {promise, resolve, reject} = Promise.withResolvers<unknown>();
+    this.#pendingCalls.set(HANDSHAKE_ID, {resolve, reject});
+    return promise.then((root) => {
+      // Record the root and fan out to registered subscriptions before
+      // handing the root back to the caller.
+      this.#root = root as object;
+      this.#rootProxies.add(this.#root);
+      for (const cb of this.#readyCbs) {
+        try {
+          cb(this.#root);
+        } catch (error) {
+          this.#logger?.error?.('Error in _onReady callback', error);
+        }
+      }
+      return root;
     });
+  }
+
+  /**
+   * Register `cb` to run with the root proxy on every successful handshake
+   * (including after a `reset()` + `waitForReady()` reconnect). Invoked
+   * synchronously if the root is already available.
+   * @internal
+   */
+  _onReady(cb: (root: object) => void): () => void {
+    this.#readyCbs.add(cb);
+    if (this.#root !== undefined) {
+      cb(this.#root);
+    }
+    return () => {
+      this.#readyCbs.delete(cb);
+    };
+  }
+
+  /**
+   * Register `cb` to run when the connection is closed via `close()`.
+   * Invoked immediately if the connection is already closed. Not fired by
+   * `reset()` — a reset is a reconnect, not a teardown.
+   * @internal
+   */
+  _onClosed(cb: () => void): () => void {
+    this.#closedCbs.add(cb);
+    if (this.#closed) {
+      cb();
+    }
+    return () => {
+      this.#closedCbs.delete(cb);
+    };
+  }
+
+  /**
+   * Report an error through the configured `logger`, if any.
+   * @internal
+   */
+  _logError(message: string, error: unknown): void {
+    this.#logger?.error?.(message, error);
   }
 
   // ============================================================
@@ -442,6 +529,17 @@ export class Connection {
    */
   get _session(): number {
     return this.#sessionId;
+  }
+
+  /**
+   * Whether `obj` was the root proxy of any handshake on this connection.
+   * Membership survives `reset()` — the registries are cleared but the
+   * WeakSet is not — so a retained pre-reset root is still recognized as a
+   * root (and a stale nested proxy is still recognized as nested).
+   * @internal
+   */
+  _isRootProxy(obj: object): boolean {
+    return this.#rootProxies.has(obj);
   }
 
   // ============================================================
