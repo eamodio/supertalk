@@ -364,4 +364,57 @@ void suite('notify', () => {
     port1.close();
     port2.close();
   });
+
+  void test('notifier retains its target proxy across GC (no release handshake)', async () => {
+    // The event-callback pattern: the receiver stores only `notify(cb)` and
+    // drops the callback proxy itself. Without the notifier anchoring the
+    // proxy, GC collects it, the FinalizationRegistry posts `release`, the
+    // peer forgets the callback, and every later notify is silently dropped.
+    const {setFlagsFromString} = await import('node:v8');
+    const {runInNewContext} = await import('node:vm');
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+
+    const {port1, port2} = new MessageChannel();
+
+    let storedNotifier: ((data: string) => void) | undefined;
+    const service = {
+      subscribe(cb: (data: string) => void): void {
+        // Deliberately keep ONLY the notifier — the cb proxy must survive
+        // through it.
+        storedNotifier = notify(cb) as unknown as (data: string) => void;
+      },
+    };
+    expose(service, port1);
+    const remote = await wrap<typeof service>(port2);
+
+    try {
+      const received: Array<string> = [];
+      await remote.subscribe((data: string) => {
+        received.push(data);
+      });
+
+      // Give GC every chance to collect the (hopefully retained) cb proxy and
+      // let any FinalizationRegistry cleanups run their macrotasks.
+      for (let i = 0; i < 3; i++) {
+        gc();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      assert.ok(storedNotifier, 'subscribe() must have stored a notifier');
+      storedNotifier('after-gc');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      assert.deepStrictEqual(
+        received,
+        ['after-gc'],
+        'the callback must still be registered on the peer after GC',
+      );
+    } finally {
+      // Close in `finally` — an assertion failure with open ports would
+      // otherwise keep the event loop (and the test runner) alive forever.
+      port1.close();
+      port2.close();
+    }
+  });
 });

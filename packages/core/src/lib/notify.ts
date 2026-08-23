@@ -51,6 +51,11 @@ export type Notify<T> = T extends (...args: infer A) => unknown
  * wrapper around a specific proxy id on this connection, not a proxy that
  * can be sent to the other side.
  *
+ * The notifier retains `target` for its own lifetime, so holding only the
+ * notifier is enough to keep the remote registration alive — dropping the
+ * proxy everywhere else does not trigger the GC `release` handshake that
+ * would tell the peer to forget the object.
+ *
  * After a `reset()`, calling a notifier created in the previous session
  * throws `'Stale proxy from previous session'`, the same as calling a stale
  * proxy.
@@ -76,7 +81,14 @@ export function notify<T>(target: T): Notify<T> {
   // method off the notifier repeatedly don't re-allocate.
   const cache = new Map<string, (...args: Array<unknown>) => void>();
 
-  return new Proxy(NON_CLONEABLE as object, {
+  // The notifier must keep `target` alive for its own lifetime. It sends by
+  // raw id, so if the caller drops every other reference to the proxy (the
+  // typical event-callback pattern: `handlers.set(key, notify(cb))`), GC
+  // would collect it, the FinalizationRegistry would post `release` for the
+  // id, and the peer would drop the object — every later notify then lands
+  // on an unknown target and is silently discarded. Anchoring the proxy on
+  // the handler object ties its lifetime to the notifier's.
+  const handler: ProxyHandler<object> & {retained?: unknown} = {
     apply: (_target, _thisArg, args: Array<unknown>) => {
       connection._sendNotify(id, undefined, args, session);
     },
@@ -91,5 +103,8 @@ export function notify<T>(target: T): Notify<T> {
       }
       return fn;
     },
-  }) as Notify<T>;
+  };
+  handler.retained = target;
+
+  return new Proxy(NON_CLONEABLE as object, handler) as Notify<T>;
 }
