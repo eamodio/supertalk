@@ -4,30 +4,13 @@
 
 import {suite, test} from 'node:test';
 import * as assert from 'node:assert';
-import {MessageChannel, type MessagePort} from 'node:worker_threads';
+import {MessageChannel} from 'node:worker_threads';
 import {Connection} from '../../lib/connection.js';
 import {notify} from '../../lib/notify.js';
 import {proxy} from '../../lib/protocol.js';
 import {WIRE_TYPE} from '../../lib/constants.js';
 import type {Handler, HandlerConnectionContext} from '../../lib/types.js';
-
-/**
- * Helper: expose a service on one port, wrap from the other.
- * Returns the host Connection, the remote proxy, and the wrap Connection.
- */
-async function setupPair<T extends object>(
-  service: T,
-  hostPort: MessagePort,
-  wrapPort: MessagePort,
-): Promise<{host: Connection; remote: T; wrap: Connection}> {
-  const host = new Connection(hostPort);
-  const wrap = new Connection(wrapPort);
-
-  host.expose(service);
-  const remote = (await wrap.waitForReady()) as T;
-
-  return {host, remote, wrap};
-}
+import {setupPair} from './test-utils.js';
 
 void suite('Connection.reset()', () => {
   void test('reset and re-expose allows new wrap session', async () => {

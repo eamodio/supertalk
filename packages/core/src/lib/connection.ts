@@ -166,6 +166,12 @@ export class Connection {
   // retained root when the peer re-handshakes. undefined until the first
   // handshake is received (or after reset()/close(), until the next one).
   #peerSession: number | undefined;
+  // The sender session of the call whose target is synchronously being
+  // invoked right now — undefined the rest of the time. Set and restored
+  // only by #withCallerSession; see its doc for the window semantics, and
+  // the `callerSession` getter for the public contract (attribution, not
+  // authentication).
+  #callerSession: number | undefined;
 
   // Pending RPC calls awaiting response
   #pendingCalls = new Map<number, PendingCall>();
@@ -617,6 +623,28 @@ export class Connection {
   }
 
   /**
+   * The session id of the peer whose call is synchronously invoking the
+   * current target right now, or `undefined` otherwise.
+   *
+   * Reliable ONLY synchronously, at the very start of a handler, before its
+   * first `await`. The window closes the instant your handler suspends (or
+   * returns) — not when the overall call settles — because another call can
+   * be dispatched and fully invoked in between. An `async` handler that
+   * `await`s before reading this may see `undefined` (or, in principle, an
+   * unrelated call's value if it reads again after a later `await`) once it
+   * resumes. A handler that needs this value must capture it into a local
+   * variable before its first `await`.
+   *
+   * Attribution, not authentication: `from` is peer-supplied and unverified
+   * — a peer can send any value it likes. Use this to tell a host's own
+   * concurrent callers apart from each other, never as a trust or security
+   * boundary. `undefined` for a peer that predates the `from` wire field.
+   */
+  get callerSession(): number | undefined {
+    return this.#callerSession;
+  }
+
+  /**
    * Whether `obj` was the root proxy of any handshake on this connection.
    * Membership survives `reset()` — the registries are cleared but the
    * WeakSet is not — so a retained pre-reset root is still recognized as a
@@ -855,7 +883,16 @@ export class Connection {
           `Proxy property target ${String(pp.targetProxyId)} not found`,
         );
       }
-      return (target as Record<string, unknown>)[pp.property];
+      // This get can invoke a user-defined getter, and it runs on the
+      // peer's behalf — the marker only arrives in the peer's return/resolve
+      // frames (call args go through #processFromClone, which never reaches
+      // this branch). Those frames carry no `from`, so attribute to the
+      // peer's session learned from its handshake — undefined for a peer
+      // that predates the field, same as an untagged call.
+      return this.#withCallerSession(
+        this.#peerSession,
+        () => (target as Record<string, unknown>)[pp.property],
+      );
     }
     if (wireType === 'thrown') {
       throw deserializeError((wire as WireThrown).error);
@@ -1238,6 +1275,7 @@ export class Connection {
           action,
           method,
           args,
+          from: this.#sessionId,
           ...(ownerSession !== undefined && {session: ownerSession}),
         },
         transfers,
@@ -1316,6 +1354,7 @@ export class Connection {
           action: 'call',
           method,
           args: wireArgs,
+          from: this.#sessionId,
           ...(ownerSession !== undefined && {session: ownerSession}),
         },
         transfers,
@@ -1567,39 +1606,49 @@ export class Connection {
     const start = logger?.debug ? performance.now() : 0;
 
     try {
-      let result: unknown;
-
-      if (action === 'get') {
+      // One #withCallerSession window for all four shapes: the guards, the
+      // property lookups, and the synchronous start of an invoked target all
+      // run attributed, and the window closes before the await below.
+      const produced = this.#withCallerSession(message.from, (): unknown => {
+        if (action === 'get') {
+          if (method === undefined) {
+            throw new TypeError('Property name required for get action');
+          }
+          return (proxyTarget as Record<string, unknown>)[method];
+        }
+        if (action === 'set') {
+          if (method === undefined) {
+            throw new TypeError('Property name required for set action');
+          }
+          (proxyTarget as Record<string, unknown>)[method] =
+            deserializedArgs[0];
+          return undefined;
+        }
         if (method === undefined) {
-          throw new TypeError('Property name required for get action');
+          // Direct function invocation
+          if (typeof proxyTarget !== 'function') {
+            throw new TypeError('Target is not callable');
+          }
+          return (proxyTarget as (...a: Array<unknown>) => unknown)(
+            ...deserializedArgs,
+          );
         }
-        result = (proxyTarget as Record<string, unknown>)[method];
-      } else if (action === 'set') {
-        if (method === undefined) {
-          throw new TypeError('Property name required for set action');
-        }
-        (proxyTarget as Record<string, unknown>)[method] = deserializedArgs[0];
-        result = undefined;
-      } else if (method === undefined) {
-        // Direct function invocation
-        if (typeof proxyTarget !== 'function') {
-          throw new TypeError('Target is not callable');
-        }
-        result = await (proxyTarget as (...a: Array<unknown>) => unknown)(
-          ...deserializedArgs,
-        );
-      } else {
-        // Method invocation
-        const targetObj = proxyTarget as Record<string, unknown>;
-        const value = targetObj[method];
+        // Method invocation. The property lookup happens inside the window
+        // too: a getter or Proxy get trap supplying the method is user code
+        // servicing this call.
+        const value = (proxyTarget as Record<string, unknown>)[method];
         if (typeof value !== 'function') {
           throw new TypeError(`${method} is not a function`);
         }
-        result = await (value as (...a: Array<unknown>) => unknown).apply(
+        return (value as (...a: Array<unknown>) => unknown).apply(
           proxyTarget,
           deserializedArgs,
         );
-      }
+      });
+      // get/set results are deliberately not awaited: a promise-valued
+      // property serializes as a promise, exactly as before the single
+      // window above existed.
+      const result = action === 'call' ? await produced : produced;
 
       if (!oneWay) {
         const transfers: Array<Transferable> = [];
@@ -1619,6 +1668,37 @@ export class Connection {
         return;
       }
       this.#post({type: 'throw', id, error: serializeError(error)});
+    }
+  }
+
+  /**
+   * Run `fn` synchronously with #callerSession set to `from`, restoring the
+   * previous value immediately once `fn` returns — BEFORE the caller awaits
+   * anything `fn` produced, not after.
+   *
+   * This is deliberately narrower than wrapping the whole dispatch. Two
+   * dispatches on this Connection can be in flight at once — one handler
+   * suspended mid-await while another is invoked — and under `batching`
+   * several dispatches even START in the same turn, since #onMessage unpacks
+   * a BatchMessage and dispatches every contained call synchronously.
+   * Setting #callerSession for the full async dispatch (call to settlement)
+   * would leave it set across exactly those gaps, so overlapping dispatches
+   * would stomp on each other's value. Scoping the window to `fn`'s own
+   * synchronous extent — up to and including a `call`/`apply`'s target
+   * running synchronously up to ITS first internal `await`, per how async
+   * functions work — means no two invocations' windows can ever overlap:
+   * JS runs one synchronous stack at a time, and each window closes and
+   * restores before its dispatch can suspend, so it is gone before any
+   * other dispatch's window can open — batched same-turn dispatches
+   * included.
+   */
+  #withCallerSession<T>(from: number | undefined, fn: () => T): T {
+    const previous = this.#callerSession;
+    this.#callerSession = from;
+    try {
+      return fn();
+    } finally {
+      this.#callerSession = previous;
     }
   }
 }

@@ -251,6 +251,14 @@ export type CallAction = 'call' | 'get' | 'set';
  *   keep today's behavior exactly — an absent `session` skips the
  *   staleness check on the receiving side rather than counting as a
  *   mismatch.
+ * - from: the sender's OWN session id — a fact about who sent the message,
+ *   not (like `session`) a belief about where `target` lives. `session` can
+ *   be wrong or absent; `from`, on this side, is always populated, since
+ *   every call has a sender. Peer-supplied and unverified, like every other
+ *   field on the wire — useful for a host to tell its own concurrent
+ *   callers apart, not as a trust boundary. Optional on the wire for the
+ *   same back-compat reason as `session` — a peer that predates this field
+ *   sends none — but never omitted by this side.
  */
 export interface CallMessage {
   type: 'call';
@@ -260,6 +268,7 @@ export interface CallMessage {
   method: string | undefined;
   args: Array<WireValue>;
   session?: number;
+  from?: number;
 }
 
 /**

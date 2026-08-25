@@ -5,6 +5,7 @@
 import {MessageChannel, type MessagePort} from 'node:worker_threads';
 import {expose, wrap} from '../../index.js';
 import type {Remote, Options} from '../../index.js';
+import {Connection} from '../../lib/connection.js';
 
 /**
  * A disposable test context that sets up a service and remote proxy over a MessageChannel.
@@ -51,4 +52,22 @@ export async function setupService<T extends object>(
       return Promise.resolve();
     },
   };
+}
+
+/**
+ * Helper: expose a service on one port, wrap from the other.
+ * Returns the host Connection, the remote proxy, and the wrap Connection.
+ */
+export async function setupPair<T extends object>(
+  service: T,
+  hostPort: MessagePort,
+  wrapPort: MessagePort,
+): Promise<{host: Connection; remote: T; wrap: Connection}> {
+  const host = new Connection(hostPort);
+  const wrap = new Connection(wrapPort);
+
+  host.expose(service);
+  const remote = (await wrap.waitForReady()) as T;
+
+  return {host, remote, wrap};
 }
