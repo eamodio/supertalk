@@ -1,5 +1,11 @@
 # @supertalk/core
 
+## 0.1.3
+
+### Patch Changes
+
+- 4c32ff5: Fix a proxy id reused across a peer's `reset()` being misrouted to the new object instead of rejected — ids restart from 0/1 after `reset()`, so a call through a proxy retained from before the reset could land on an unrelated object registered under the same id in the new session, and a `release` from a GC'd pre-reset proxy could unregister it outright. Each connection now carries a random, instance-unique session token (regenerated on `reset()`, so a peer rebuilt as a fresh connection over the same endpoint can't be mistaken for the old one), and every wire proxy carries the session of the side that owns its target. Because the session rides on the proxy rather than on a handshake, this protects both directions — including a `wrap()`-only side, which never calls `expose()` and so previously left every call made to it untagged. Receiving a proxy freezes its owner session onto that proxy object; calls and releases carry the frozen tag, and the receiver rejects (or, for one-way calls and releases, silently drops) anything tagged with a session other than its current one. An id reclaimed in a newer peer session mints a new, distinct proxy so the retained one stays stale, while the root is revalidated in place — it names the peer's root service as a stable role, so holding it across a peer reset keeps working. The tags stay optional on the wire, so peers that predate this fix are unaffected.
+
 ## 0.1.2
 
 ### Patch Changes
