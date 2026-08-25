@@ -246,6 +246,11 @@ export type CallAction = 'call' | 'get' | 'set';
  * - target: proxy ID of the target object
  * - action: 'call' to invoke, 'get' to get property, 'set' to set property
  * - method: method/property name, or undefined for direct function invocation
+ * - session: the session the sender believes `target` lives in, learned from
+ *   the peer's last handshake. Optional so peers that predate this field
+ *   keep today's behavior exactly — an absent `session` skips the
+ *   staleness check on the receiving side rather than counting as a
+ *   mismatch.
  */
 export interface CallMessage {
   type: 'call';
@@ -254,12 +259,20 @@ export interface CallMessage {
   action: CallAction;
   method: string | undefined;
   args: Array<WireValue>;
+  session?: number;
 }
 
+/**
+ * `session` is populated only on the handshake return (`id ===
+ * HANDSHAKE_ID`), carrying the sender's own session id so the receiver can
+ * tag later calls with the session it believes the target lives in. Absent
+ * on every other `return`.
+ */
 export interface ReturnMessage {
   type: 'return';
   id: number;
   value: WireValue;
+  session?: number;
 }
 
 export interface ThrowMessage {
@@ -270,10 +283,17 @@ export interface ThrowMessage {
 
 /**
  * Release a proxy or handle, allowing the source to garbage collect the target.
+ *
+ * - session: the peer session the sender believes `id` lives in. Optional —
+ *   peers that predate this field send none, and an absent value keeps the
+ *   unconditional release the receiver has always performed. When present
+ *   and stale, the release is ignored: after a `reset()` the id may have been
+ *   reused for an unrelated, still-live object.
  */
 export interface ReleaseMessage {
   type: 'release';
   id: number;
+  session?: number;
 }
 
 /**
@@ -435,6 +455,18 @@ export interface WireProxy {
   id: number;
   /** Opaque flag - proxy is a handle with no property access */
   o: boolean;
+  /**
+   * Session of the side that OWNS `id`'s target object — the sender's own
+   * session for an object it registered, or, when echoing a proxy back, the
+   * owner session that proxy was received with. Because it rides on the
+   * proxy itself, tagging works in both directions regardless of which side
+   * called `expose()`.
+   *
+   * Optional: peers that predate the field send none, and an absent value
+   * falls back to the session learned from the handshake, preserving the
+   * older behavior exactly.
+   */
+  s?: number;
 }
 
 export interface WirePromise {

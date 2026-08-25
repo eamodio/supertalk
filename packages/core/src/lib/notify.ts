@@ -88,9 +88,19 @@ export function notify<T>(target: T): Notify<T> {
   // id, and the peer would drop the object — every later notify then lands
   // on an unknown target and is silently discarded. Anchoring the proxy on
   // the handler object ties its lifetime to the notifier's.
+  // Read the owner session off `target` at send time, not once here: it is
+  // frozen per proxy, but the root's is rewritten in place when the peer
+  // re-handshakes, and a cached copy would keep tagging with the superseded
+  // session.
   const handler: ProxyHandler<object> & {retained?: unknown} = {
     apply: (_target, _thisArg, args: Array<unknown>) => {
-      connection._sendNotify(id, undefined, args, session);
+      connection._sendNotify(
+        id,
+        undefined,
+        args,
+        session,
+        connection._proxyOwnerSession(target as object),
+      );
     },
 
     get: (_target, prop) => {
@@ -98,7 +108,13 @@ export function notify<T>(target: T): Notify<T> {
       let fn = cache.get(prop);
       if (fn === undefined) {
         fn = (...args: Array<unknown>) =>
-          connection._sendNotify(id, prop, args, session);
+          connection._sendNotify(
+            id,
+            prop,
+            args,
+            session,
+            connection._proxyOwnerSession(target as object),
+          );
         cache.set(prop, fn);
       }
       return fn;

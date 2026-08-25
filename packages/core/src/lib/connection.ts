@@ -52,6 +52,29 @@ import {
 } from './protocol.js';
 
 /**
+ * Allocate a session id — an instance-unique token, not a counter. A peer
+ * recreated as a brand-new Connection over a persistent endpoint (a webview
+ * reloading, a worker respawning) would restart a counter at the same value,
+ * and calls tagged with it would sail through the receiver's staleness check.
+ * The randomness is for collision avoidance, not security.
+ */
+const newSessionId = (): number => Math.floor(Math.random() * 2 ** 52);
+
+/**
+ * Anchors the proxy a property callable was read off. Symbol-keyed so it is
+ * invisible to structured clone, `Object.keys`, and the proxy-property
+ * serialization at #processForClone. See #createProxyProperty.
+ */
+const RETAINED_PROXY = Symbol('retainedProxy');
+
+/**
+ * Inner cache key standing in for an unknown owner session — a proxy from a
+ * peer that predates the `s` wire field, or one received before any
+ * handshake. Real sessions are non-negative, so this can never collide.
+ */
+const UNKNOWN_SESSION = -1;
+
+/**
  * Pending call waiting for a response.
  */
 interface PendingCall {
@@ -107,11 +130,42 @@ export class Connection {
   #localById = new Map<number, object>();
   #localByObject = new WeakMap<object, number>();
 
-  // Remote proxy cache (weak refs) - proxies we received from remote
-  #remoteProxyById = new Map<number, WeakRef<object>>();
+  // Remote proxy cache (weak refs), keyed by id and then by owner session.
+  // Identity is per (owner session, id): the peer can reclaim an id for an
+  // unrelated object after a reset(), so each owner session gets its own
+  // proxy and they coexist. The root (id 0) is the one exception — it names a
+  // role rather than an object, and is re-keyed in place (see
+  // #createRemoteProxy). Entries must coexist rather than replace one
+  // another because a stale call's arguments are deserialized before the call
+  // is rejected (see #handleCall): a stale arg naming a reused id reaches
+  // this cache, and must not be able to evict the live proxy for it.
+  // The key UNKNOWN_SESSION stands in for an owner session we don't know —
+  // a peer that predates the `s` wire field, or a proxy seen before any
+  // handshake — and outgoing calls through such a proxy omit the wire field.
+  #remoteProxyById = new Map<number, Map<number, WeakRef<object>>>();
   #remoteProxyByObject = new WeakMap<object, number>();
-  #remoteCleanup: FinalizationRegistry<{id: number; session: number}>;
-  #sessionId = 0;
+  // The owner session frozen onto each remote proxy, and the tag every call
+  // through it carries. This is not a duplicate of #remoteProxyById's key:
+  // that map answers "which proxy is current for this (owner, id)", while a
+  // retained *stale* proxy still has to know its own owner session at send
+  // time, and it is not reachable from the cache by id — a newer proxy for
+  // the same id holds its own key. Reading it here needs no lookup and cannot
+  // be confused by a successor. The root's entry is rewritten when it is
+  // re-keyed; see #createRemoteProxy.
+  #remoteProxyOwnerSession = new WeakMap<object, number | undefined>();
+  #remoteCleanup: FinalizationRegistry<{
+    id: number;
+    session: number;
+    ownerKey: number;
+  }>;
+  #sessionId = newSessionId();
+  // The peer's session id, learned from its handshake `return` frame. Owner
+  // sessions ride on the wire proxies themselves, so this is not what tags
+  // outgoing calls; it has two narrow jobs: the fallback owner session for a
+  // peer that predates the `s` wire field, and the trigger for re-keying a
+  // retained root when the peer re-handshakes. undefined until the first
+  // handshake is received (or after reset()/close(), until the next one).
+  #peerSession: number | undefined;
 
   // Pending RPC calls awaiting response
   #pendingCalls = new Map<number, PendingCall>();
@@ -154,10 +208,37 @@ export class Connection {
     // reset() are ignored (IDs restart from 0 after reset, so a stale release
     // could otherwise match a newly allocated ID).
     this.#remoteCleanup = new FinalizationRegistry(
-      ({id, session}: {id: number; session: number}) => {
+      ({
+        id,
+        session,
+        ownerKey,
+      }: {
+        id: number;
+        session: number;
+        ownerKey: number;
+      }) => {
         if (session !== this.#sessionId) return;
-        this.#remoteProxyById.delete(id);
-        this.#post({type: 'release', id});
+        const byOwner = this.#remoteProxyById.get(id);
+        const ref = byOwner?.get(ownerKey);
+        // Nothing under this exact key: either an earlier finalizer for the
+        // same (owner session, id) already cleaned up and released, or the
+        // root was re-keyed — which re-registers the surviving proxy, so that
+        // registration owns its release.
+        if (byOwner === undefined || ref === undefined) return;
+        // A live object under this exact key means the same (owner, id) was
+        // re-minted after this proxy died; that newer registration owns the
+        // release, and sending one now would unregister its target.
+        if (ref.deref() !== undefined) return;
+        byOwner.delete(ownerKey);
+        if (byOwner.size === 0) this.#remoteProxyById.delete(id);
+        // ownerKey is the owner session this proxy named. Tagging is what
+        // stops a release crossing a peer reset from unregistering whatever
+        // unrelated object has since reclaimed the id.
+        this.#post({
+          type: 'release',
+          id,
+          ...(ownerKey !== UNKNOWN_SESSION && {session: ownerKey}),
+        });
       },
     );
 
@@ -267,6 +348,7 @@ export class Connection {
       type: 'return',
       id: HANDSHAKE_ID,
       value: this.#makeProxyWire(obj),
+      session: this.#sessionId,
     });
   }
 
@@ -300,6 +382,10 @@ export class Connection {
     // synchronously against a dead session, and notify closed-callbacks so a
     // pending subscription `ready` settles instead of hanging.
     this.#root = undefined;
+    // A closed connection must not tag outgoing calls with a peer session
+    // learned before teardown — the next session's handshake is what
+    // re-establishes it.
+    this.#peerSession = undefined;
     for (const cb of this.#closedCbs) {
       try {
         cb();
@@ -349,10 +435,16 @@ export class Connection {
     this.#remoteProxyById.clear();
     // WeakMap has no .clear() — reassign to drop all entries
     this.#remoteProxyByObject = new WeakMap();
-    // Increment session ID to invalidate any outstanding FinalizationRegistry
-    // callbacks from the previous session. IDs restart from 0, so without this
-    // a stale finalizer could release a newly allocated object with the same ID.
-    this.#sessionId++;
+    // Take a fresh session token to invalidate any outstanding
+    // FinalizationRegistry callbacks from the previous session. IDs restart
+    // from 0, so without this a stale finalizer could release a newly
+    // allocated object with the same ID.
+    this.#sessionId = newSessionId();
+    // Forget the peer's session too — it's only known from a handshake we've
+    // already received, and a new session must not tag its calls with a
+    // belief carried over from before the reset. The next handshake sets it
+    // again.
+    this.#peerSession = undefined;
 
     // Reset ID allocation
     this.#nextId = 0;
@@ -500,13 +592,6 @@ export class Connection {
   // ============================================================
 
   /**
-   * Get the remote proxy for an ID, if still alive.
-   */
-  #getRemoteProxy(id: number): object | undefined {
-    return this.#remoteProxyById.get(id)?.deref();
-  }
-
-  /**
    * Get the remote ID for a proxy, if it exists.
    */
   #getRemoteProxyId(obj: object): number | undefined {
@@ -570,10 +655,25 @@ export class Connection {
    * Create a WireProxy for a value.
    */
   #makeProxyWire(value: object, opaque = false): WireProxy {
+    const remoteId = this.#getRemoteProxyId(value);
+    if (remoteId !== undefined) {
+      // Echoing a proxy back to the side that owns it: carry the owner
+      // session this proxy was received with, not ours — the target lives in
+      // the peer's session, not this one. Absent for a proxy from a peer
+      // that predates the field.
+      const ownerSession = this.#remoteProxyOwnerSession.get(value);
+      return {
+        [WIRE_TYPE]: 'proxy',
+        id: remoteId,
+        o: opaque,
+        ...(ownerSession !== undefined && {s: ownerSession}),
+      };
+    }
     return {
       [WIRE_TYPE]: 'proxy',
-      id: this.#getRemoteProxyId(value) ?? this.#registerLocal(value),
+      id: this.#registerLocal(value),
       o: opaque,
+      s: this.#sessionId,
     };
   }
 
@@ -783,15 +883,26 @@ export class Connection {
     }
 
     if (isWireProxy(value)) {
+      // A peer that predates `s` sends none; fall back to the session learned
+      // from the handshake.
+      const ownerSession = value.s ?? this.#peerSession;
       const local = this.#getLocal(value.id);
-      if (local) {
+      // An echo of one of our own ids resolves to the live local object only
+      // if it was minted in our current session. After a reset() that id may
+      // hold an unrelated object, so a stale echo must not resolve to it —
+      // fall through and build a remote proxy carrying the stale owner
+      // session instead. Calling through that proxy fails cleanly against
+      // the peer (unknown target, or rejected as stale) rather than silently
+      // invoking the wrong local object.
+      if (
+        local !== undefined &&
+        (value.s === undefined || value.s === this.#sessionId)
+      ) {
         const result = proxy(local, value.o);
         seen.set(value, result);
         return result;
       }
-      const result =
-        this.#getRemoteProxy(value.id) ??
-        this.#createRemoteProxy(value.id, value.o);
+      const result = this.#createRemoteProxy(value.id, value.o, ownerSession);
       seen.set(value, result);
       return result;
     }
@@ -904,54 +1015,134 @@ export class Connection {
    * Create a proxy for a remote object.
    * Opaque proxies are simple objects (no JS Proxy overhead).
    */
-  #createRemoteProxy(id: number, opaque?: boolean): object {
-    let proxy = this.#getRemoteProxy(id);
-    if (proxy === undefined) {
-      // Capture the session at proxy creation time so we can detect stale
-      // proxies that survive a reset().
-      const session = this.#sessionId;
-      proxy = opaque
-        ? // Opaque: simple non-cloneable object (handle)
-          {__o: NON_CLONEABLE}
-        : // Full proxy with property/method access
-          new Proxy(NON_CLONEABLE as object, {
-            apply: (_target, _thisArg, args: Array<unknown>) => {
-              this.#assertSession(session);
-              return this.#makeCall(id, undefined, args);
-            },
-
-            get: (_target, prop) => {
-              if (prop === INTERNAL) return this;
-              // Not thenable at top level (prevents auto-await issues)
-              return typeof prop === 'string' && prop !== 'then'
-                ? this.#createProxyProperty(id, prop, session)
-                : undefined;
-            },
-
-            set: (_target, prop, value) => {
-              if (typeof prop !== 'string') return false;
-              this.#assertSession(session);
-              const transfers: Array<Transferable> = [];
-              // Async transport errors cannot be surfaced synchronously
-              // from a Proxy set trap. Catch to prevent unhandled rejections.
-              void this.#sendCall(
-                this.#allocId(),
-                id,
-                'set',
-                prop,
-                [this.#toWire(value, '', transfers)],
-                transfers,
-              ).catch(
-                // eslint-disable-next-line @typescript-eslint/no-empty-function
-                () => {},
-              );
-              return true;
-            },
-          });
-      this.#remoteProxyById.set(id, new WeakRef(proxy));
-      this.#remoteProxyByObject.set(proxy, id);
-      this.#remoteCleanup.register(proxy, {id, session: this.#sessionId});
+  #createRemoteProxy(
+    id: number,
+    opaque: boolean | undefined,
+    ownerSession: number | undefined,
+  ): object {
+    const byOwner = this.#remoteProxyById.get(id);
+    if (byOwner !== undefined) {
+      if (ownerSession === undefined) {
+        // A peer that sends no `s` has only ever had one meaning for this id,
+        // so whichever entry is still live is the right one.
+        for (const ref of byOwner.values()) {
+          const cached = ref.deref();
+          if (cached !== undefined) return cached;
+        }
+      } else {
+        const cached = byOwner.get(ownerSession)?.deref();
+        // Exact (owner session, id) hit: the same object as before.
+        if (cached !== undefined) return cached;
+        if (id === HANDSHAKE_ID && ownerSession === this.#peerSession) {
+          // The root is a role, not an object. Id 0 is always and only the
+          // expose-side root — expose() registers it first, and the wrap
+          // side's own locals are odd — so a new owner session here means
+          // "the peer's root service" moved to a fresh object under the same
+          // role. Re-key the object that actually holds the role — #root —
+          // rather than scanning for a live entry: isolated id-0 proxies for
+          // superseded sessions coexist in this map by design (the check
+          // above mints them), so a scan can promote one of those into the
+          // role and leave the real root frozen at its old session.
+          // Only the peer's CURRENT session may claim the role: a stale
+          // frame naming id 0 under a superseded session must not re-key a
+          // live root backwards, so it falls through and mints an isolated
+          // proxy that fails cleanly instead. (The handshake records
+          // #peerSession before deserializing its value, so the legitimate
+          // re-key always passes this check.)
+          const held = this.#root;
+          if (
+            held !== undefined &&
+            this.#remoteProxyByObject.get(held) === id
+          ) {
+            const heldKey =
+              this.#remoteProxyOwnerSession.get(held) ?? UNKNOWN_SESSION;
+            const ref = byOwner.get(heldKey) ?? new WeakRef(held);
+            byOwner.delete(heldKey);
+            byOwner.set(ownerSession, ref);
+            this.#remoteProxyOwnerSession.set(held, ownerSession);
+            // Re-key the finalizer registration too, so its held ownerKey
+            // still matches the entry it is responsible for releasing.
+            this.#remoteCleanup.unregister(held);
+            this.#remoteCleanup.register(
+              held,
+              {id, session: this.#sessionId, ownerKey: ownerSession},
+              held,
+            );
+            return held;
+          }
+          // No retained root — the initial handshake, or a root only ever
+          // seen as a call argument. Fall through and mint the canonical
+          // root fresh; any isolated id-0 proxies stay frozen at their own
+          // keys.
+        }
+        // A non-root id reclaimed in another peer session: this proxy and any
+        // retained one name *different* objects. Fall through and mint a new
+        // proxy under its own key, leaving retained ones frozen at their own
+        // owner sessions so their calls keep being rejected as stale.
+      }
     }
+    // Capture the session at proxy creation time so we can detect stale
+    // proxies that survive a reset().
+    const session = this.#sessionId;
+    const ownerKey = ownerSession ?? UNKNOWN_SESSION;
+    const proxy: object = opaque
+      ? // Opaque: simple non-cloneable object (handle)
+        {__o: NON_CLONEABLE}
+      : // Full proxy with property/method access
+        new Proxy(NON_CLONEABLE as object, {
+          apply: (_target, _thisArg, args: Array<unknown>) => {
+            this.#assertSession(session);
+            return this.#makeCall(
+              id,
+              undefined,
+              args,
+              this.#remoteProxyOwnerSession.get(proxy),
+            );
+          },
+
+          get: (_target, prop) => {
+            if (prop === INTERNAL) return this;
+            // Not thenable at top level (prevents auto-await issues)
+            return typeof prop === 'string' && prop !== 'then'
+              ? this.#createProxyProperty(id, prop, session, proxy)
+              : undefined;
+          },
+
+          set: (_target, prop, value) => {
+            if (typeof prop !== 'string') return false;
+            this.#assertSession(session);
+            const transfers: Array<Transferable> = [];
+            // Async transport errors cannot be surfaced synchronously
+            // from a Proxy set trap. Catch to prevent unhandled rejections.
+            void this.#sendCall(
+              this.#allocId(),
+              id,
+              'set',
+              prop,
+              [this.#toWire(value, '', transfers)],
+              transfers,
+              this.#remoteProxyOwnerSession.get(proxy),
+            ).catch(
+              // eslint-disable-next-line @typescript-eslint/no-empty-function
+              () => {},
+            );
+            return true;
+          },
+        });
+    // Freeze the owner session onto this proxy — see the field comments on
+    // #remoteProxyById and #remoteProxyOwnerSession for why it is frozen
+    // per-proxy rather than re-read by id at call time.
+    let entries = byOwner;
+    if (entries === undefined) {
+      entries = new Map();
+      this.#remoteProxyById.set(id, entries);
+    }
+    entries.set(ownerKey, new WeakRef(proxy));
+    this.#remoteProxyOwnerSession.set(proxy, ownerSession);
+    this.#remoteProxyByObject.set(proxy, id);
+    // The proxy doubles as its own unregister token, so a root revalidation
+    // can re-key this registration.
+    this.#remoteCleanup.register(proxy, {id, session, ownerKey}, proxy);
     return proxy;
   }
 
@@ -962,10 +1153,20 @@ export class Connection {
     target: number,
     prop: string,
     session: number,
+    targetProxy: object,
   ): ProxyProperty {
+    // Read the owner session off the proxy at send time rather than
+    // capturing it: the root's tag is rewritten in place when the peer
+    // re-handshakes (see #createRemoteProxy), and a captured copy would go
+    // on tagging with the superseded session.
     const callable = (...args: Array<unknown>): Promise<unknown> => {
       this.#assertSession(session);
-      return this.#makeCall(target, prop, args);
+      return this.#makeCall(
+        target,
+        prop,
+        args,
+        this.#remoteProxyOwnerSession.get(targetProxy),
+      );
     };
 
     callable.then = <TResult1 = unknown, TResult2 = never>(
@@ -977,16 +1178,30 @@ export class Connection {
         | null,
     ): Promise<TResult1 | TResult2> => {
       this.#assertSession(session);
-      return this.#sendCall(this.#allocId(), target, 'get', prop, [], []).then(
-        onfulfilled,
-        onrejected,
-      );
+      return this.#sendCall(
+        this.#allocId(),
+        target,
+        'get',
+        prop,
+        [],
+        [],
+        this.#remoteProxyOwnerSession.get(targetProxy),
+      ).then(onfulfilled, onrejected);
     };
 
     (callable as ProxyProperty)[PROXY_PROPERTY_BRAND] = {
       targetProxyId: target,
       property: prop,
     };
+
+    // The callable sends by raw id, so a detached `const fn = remote.method`
+    // must keep its proxy alive: otherwise GC collects the proxy, the
+    // FinalizationRegistry drops the #remoteProxyById entry, and the owner
+    // session goes with it — the call then goes out untagged and skips the
+    // peer's staleness check entirely, where a live proxy would have been
+    // rejected. Same hazard, and same anchoring, as notify().
+    (callable as unknown as Record<symbol, unknown>)[RETAINED_PROXY] =
+      targetProxy;
 
     return callable as ProxyProperty;
   }
@@ -999,6 +1214,9 @@ export class Connection {
    * Send a call message and return a promise for the response.
    * The call ID must be pre-allocated by the caller so it can be passed to
    * serialization context (e.g. for handler per-call tracking).
+   *
+   * `ownerSession` is the frozen tag of the proxy the call was made through
+   * (see #remoteProxyOwnerSession); undefined omits the wire field entirely.
    */
   #sendCall(
     callId: number,
@@ -1007,12 +1225,21 @@ export class Connection {
     method: string | undefined,
     args: Array<unknown>,
     transfers: Array<Transferable>,
+    ownerSession: number | undefined,
   ): Promise<unknown> {
     const {promise, resolve, reject} = Promise.withResolvers<unknown>();
     this.#pendingCalls.set(callId, {resolve, reject});
     try {
       this.#post(
-        {type: 'call', id: callId, target, action, method, args},
+        {
+          type: 'call',
+          id: callId,
+          target,
+          action,
+          method,
+          args,
+          ...(ownerSession !== undefined && {session: ownerSession}),
+        },
         transfers,
       );
     } catch (error) {
@@ -1029,6 +1256,7 @@ export class Connection {
     target: number,
     method: string | undefined,
     args: Array<unknown>,
+    ownerSession: number | undefined,
   ): Promise<unknown> {
     const transfers: Array<Transferable> = [];
     // Share seen map across all args to preserve identity for shared references.
@@ -1045,7 +1273,18 @@ export class Connection {
         this.#processForClone(arg, '', transfers, seen, callId),
       ),
       transfers,
+      ownerSession,
     );
+  }
+
+  /**
+   * The owner session frozen onto a remote proxy — the tag an outgoing call
+   * through `obj` must carry. Read live rather than cached by callers, since
+   * the root's tag is rewritten in place when the peer re-handshakes.
+   * @internal
+   */
+  _proxyOwnerSession(obj: object): number | undefined {
+    return this.#remoteProxyOwnerSession.get(obj);
   }
 
   /**
@@ -1058,6 +1297,7 @@ export class Connection {
     method: string | undefined,
     args: Array<unknown>,
     session: number,
+    ownerSession: number | undefined,
   ): void {
     this.#assertSession(session);
     try {
@@ -1076,6 +1316,7 @@ export class Connection {
           action: 'call',
           method,
           args: wireArgs,
+          ...(ownerSession !== undefined && {session: ownerSession}),
         },
         transfers,
       );
@@ -1107,6 +1348,20 @@ export class Connection {
   #processMessage(message: Message): void {
     switch (message.type) {
       case 'release': {
+        // A release tagged with a session we've since reset() past names an
+        // id that now belongs to an unrelated object — honoring it would
+        // unregister a live target. An absent tag comes from a peer that
+        // predates the field and releases unconditionally, as before.
+        if (
+          message.session !== undefined &&
+          message.session !== this.#sessionId
+        ) {
+          this.#logger?.debug?.(
+            'Ignoring release for a superseded session (peer reset)',
+            message.id,
+          );
+          break;
+        }
         // Unified release for both proxies and handles
         const obj = this.#localById.get(message.id);
         if (obj !== undefined) {
@@ -1130,6 +1385,41 @@ export class Connection {
         );
         break;
       case 'return':
+        if (message.id === HANDSHAKE_ID && message.session !== undefined) {
+          // Record the peer's session from every handshake, not just the
+          // first — a peer that reset() and re-exposed sends a new one, and
+          // we need the latest value regardless of whether we still have a
+          // pending waitForReady() call to settle (we may not: only the
+          // side that calls waitForReady() again after its own reset does).
+          // Guarded on the field being present: an ordinary return that
+          // happens to use id 0 must not clear a known peer session, and an
+          // older peer sends none at all.
+          // Must happen before #settlePending below, which deserializes
+          // `message.value` into the root proxy: a peer that predates the `s`
+          // wire field has no owner session on that proxy, so the root falls
+          // back to this value and would otherwise be tagged with the
+          // previous session and rejected as stale on every call.
+          this.#peerSession = message.session;
+          if (
+            !this.#pendingCalls.has(HANDSHAKE_ID) &&
+            this.#root !== undefined
+          ) {
+            // Nothing is awaiting readiness, so #settlePending below won't
+            // deserialize the value — but a consumer that never calls
+            // waitForReady() a second time is still holding the root from
+            // the previous handshake. A root names "the peer's root
+            // service", a stable role rather than one particular object, so
+            // revalidate the retained root against the re-exposed one:
+            // deserializing runs #createRemoteProxy, which re-keys it to the
+            // new owner session, and the discarded result fires nothing
+            // else. Guarded so a pending handshake doesn't deserialize the
+            // value twice, and on a root actually being retained — after
+            // our own reset()/close() there is nothing to revalidate, and
+            // deserializing would mint a throwaway proxy whose eventual GC
+            // posts a release against the peer's live root.
+            this.#fromWire(message.value);
+          }
+        }
         this.#settlePending(this.#pendingCalls, message.id, message.value);
         this.#notifyCallSettle(message.id);
         break;
@@ -1218,6 +1508,37 @@ export class Connection {
       this.#processFromClone(arg, seen),
     );
 
+    // Reject calls stamped with a session we've since reset() past. This is
+    // the case the missing-target check below cannot catch: after a reset(),
+    // ids restart from 0, so a stale call can name an id that is not
+    // missing — it now belongs to an unrelated object registered in the new
+    // session. `session` is only present once the sender has seen at least
+    // one of our handshakes and is absent from older peers, so an absent
+    // value skips this check entirely rather than counting as a mismatch.
+    //
+    // Deliberately after deserialization, like the missing-target check:
+    // dropping the args on the wire would strand every resource they carry —
+    // proxy args pinned in the sender's registry with no proxy here to ever
+    // release them, transferables never adopted, handler-serialized args
+    // (e.g. a signal subscription) left streaming forever. Deserializing is
+    // safe: the arg proxies name objects the *sender* registered in its own
+    // current session, and the result is simply discarded.
+    if (message.session !== undefined && message.session !== this.#sessionId) {
+      const error = {
+        name: 'ReferenceError',
+        message: 'Stale session',
+      };
+      if (oneWay) {
+        this.#logger?.debug?.(
+          'Dropping one-way call for a superseded session (peer reset)',
+          error,
+        );
+        return;
+      }
+      this.#post({type: 'throw', id, error});
+      return;
+    }
+
     // Look up the target object
     const proxyTarget = this.#getLocal(target);
     if (!proxyTarget) {
@@ -1226,12 +1547,13 @@ export class Connection {
         message: `Proxy target ${String(target)} not found`,
       };
       if (oneWay) {
-        // Expected protocol debris, not a failure: a one-way call has no reply
-        // channel, and a missing target routinely means this side reset()
-        // (restarting its registry from id 0) while the peer's sends were
-        // already in flight — the peer only learns of the new session at the
-        // next handshake, which re-issues subscriptions anyway. Log at debug
-        // so a genuine leak is still diagnosable without paging every reset.
+        // Expected protocol debris, not a failure: a one-way call has no
+        // reply channel. A reused id that now maps to a different object is
+        // already caught by the session check above, so a genuinely missing
+        // target here just means in-flight debris — e.g. a release message
+        // and a call crossing paths, or a call for an id the peer never
+        // finished registering. Log at debug so a real leak is still
+        // diagnosable without paging every reset.
         this.#logger?.debug?.(
           'Dropping one-way call for unknown proxy target (peer likely reset)',
           error,
